@@ -1624,9 +1624,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let pointer_click = resp.clicked_by(egui::PointerButton::Primary);
     let accesskit_click = resp.clicked() && !pointer_click && !keyboard_click;
     let focus_click = pointer_click || accesskit_click || resp.drag_started();
-    if focus_click {
-        // Android: a touch on the page asks for the soft keyboard. A ribbon click restores focus
-        // without reopening it (`WordApp::refocus_after_chrome_click`).
+    // Android: a touch on the page asks for the soft keyboard. Space and Enter on a hardware
+    // keyboard also look like a primary click to egui, but must not open Gboard. A ribbon click
+    // restores keyboard focus without reopening it (`WordApp::refocus_after_chrome_click`).
+    if (pointer_click && resp.interact_pointer_pos().is_some()) || accesskit_click || resp.drag_started() {
         app.canvas.ime_wanted = true;
     }
     if focus_click || (app.canvas.want_focus && !resp.has_focus()) {
