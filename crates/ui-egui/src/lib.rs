@@ -2287,6 +2287,10 @@ impl WordApp {
     /// on any click elsewhere; only a click that left nothing focused counts, so a text field
     /// (font size, zoom, command search) keeps the focus it took, and clicks on a dialog, menu or
     /// popup, or while one is open, leave focus alone. Clicks on the page are the canvas's own.
+    ///
+    /// It only restores focus: the selection and its typed formatting stay as they were. It also
+    /// never closes the soft keyboard, so tapping Bold, the font box or another ribbon tab keeps
+    /// typing (and the keyboard) where it was on Android.
     fn refocus_after_chrome_click(&mut self, ctx: &egui::Context) {
         if self.ui.backstage || self.dialog.is_some() || self.colors.is_some() {
             return;
@@ -2299,11 +2303,6 @@ impl WordApp {
         // The page handles its own clicks (comment balloons there take the keyboard themselves).
         if self.canvas.balloon.is_some() || self.canvas.viewport.is_some_and(|v| v.contains(pos)) {
             return;
-        }
-        // Android: touching the ribbon, a pane or the status bar puts the soft keyboard away. A
-        // focused text field still asks for it through its own `IMEOutput`.
-        if cfg!(target_os = "android") {
-            self.canvas.ime_wanted = false;
         }
         let on_chrome = ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background);
         if on_chrome && ctx.memory(|m| m.focused().is_none()) && !egui::Popup::is_any_open(ctx) {
@@ -5452,6 +5451,100 @@ mod tests {
         h.event(egui::Event::Text(" bold".into()));
         h.step();
         assert!(body_text(h.state()).ends_with(" bold"), "Bold: typing continues in the document");
+    }
+
+    /// A real primary press or release at `at`, stepped on its own so egui sees a gesture.
+    fn primary_button(h: &mut egui_kittest::Harness<'_, WordApp>, at: egui::Pos2, pressed: bool) {
+        h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() });
+        h.step();
+    }
+
+    /// Android: a real tap on the page asks for the soft keyboard, which the host watches through
+    /// `soft_keyboard_request`; a flick or a scroll (a drag) must never ask for it, even though its
+    /// press started on the page. A drag-select is a drag too.
+    #[test]
+    fn only_a_page_tap_asks_for_the_soft_keyboard() {
+        let mut a = typed();
+        a.canvas.ime_wanted = false; // the Android cold start: the keyboard is down
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        for _ in 0..8 {
+            h.step();
+        }
+        assert!(h.state().canvas.focused, "the page has keyboard focus");
+        let page = h.state().canvas.page_rects.first().copied().expect("a page");
+        let request = h.state().canvas.soft_keyboard_request;
+        assert!(!h.state().canvas.ime_wanted, "cold start: the keyboard stays down");
+
+        // Press on the page and drag: scrolling and selecting must not ask for the keyboard.
+        let from = page.center();
+        h.event(egui::Event::PointerMoved(from));
+        h.step();
+        primary_button(&mut h, from, true);
+        h.event(egui::Event::PointerMoved(from + egui::vec2(80.0, 50.0)));
+        h.step();
+        primary_button(&mut h, from + egui::vec2(80.0, 50.0), false);
+        assert_eq!(h.state().canvas.soft_keyboard_request, request, "a drag is not a page tap");
+        assert!(!h.state().canvas.ime_wanted, "a drag leaves the keyboard as it was");
+
+        // A tap (press and release in place) asks for it once.
+        for _ in 0..30 {
+            h.step(); // past the double-click window
+        }
+        h.event(egui::Event::PointerMoved(from));
+        h.step();
+        primary_button(&mut h, from, true);
+        primary_button(&mut h, from, false);
+        assert_eq!(h.state().canvas.soft_keyboard_request, request + 1, "one tap, one request");
+        assert!(h.state().canvas.ime_wanted, "a page tap opens the keyboard");
+    }
+
+    /// Android: tapping a formatting control keeps the soft keyboard up, does not move the caret,
+    /// and leaves the formatting that typing will use active.
+    #[test]
+    fn formatting_clicks_keep_the_soft_keyboard_and_the_caret() {
+        use egui::accesskit::Role;
+
+        let mut a = typed();
+        a.canvas.ime_wanted = true; // the page was tapped: Gboard is up
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        for _ in 0..8 {
+            h.step();
+        }
+        let caret = h.state().session.sel.clone();
+        let request = h.state().canvas.soft_keyboard_request;
+        let bold = h.get_by_role_and_label(Role::Button, "Bold").rect().center();
+        h.event(egui::Event::PointerMoved(bold));
+        h.step();
+        primary_button(&mut h, bold, true);
+        primary_button(&mut h, bold, false);
+        h.step();
+
+        assert_eq!(h.state().session.sel, caret, "the caret stays where it was");
+        assert!(h.state().canvas.focused, "the page keeps keyboard focus");
+        assert!(h.state().canvas.ime_wanted, "a formatting click keeps the keyboard up");
+        assert_eq!(h.state().canvas.soft_keyboard_request, request, "the ribbon is not the page");
+        let pending = h.state().session.pending.as_ref().expect("Bold arms the typing formatting");
+        assert_eq!(pending.bold, Some(true), "Bold is armed for what is typed next");
+
+        h.event(egui::Event::Text(" bold".into()));
+        h.step();
+        let para = h.state().session.doc.para_at(&caret.focus).expect("the caret's paragraph");
+        assert_eq!(para.props_of_char(caret.focus.off).bold, Some(true), "the typed text is bold");
+        assert!(body_text(h.state()).ends_with(" bold"), "the text reached the page");
     }
 
     /// Types `text` after a click on `what` and checks it reached the document (#1093).

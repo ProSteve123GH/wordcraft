@@ -92,6 +92,10 @@ pub struct CanvasState {
     /// The page keeps keyboard focus after a ribbon click (typing continues where it was), but the
     /// soft keyboard stays down until the page itself is touched.
     pub ime_wanted: bool,
+    /// Counts real primary taps on the page. The Android host shows the soft keyboard when this
+    /// changes; a drag (a flick, a scroll or a selection) never bumps it, so scrolling does not
+    /// reopen Gboard. Unlike `ime_wanted`, it says "show it now", once per tap.
+    pub soft_keyboard_request: u64,
     /// The page's widget id and the pass that last drew it, so a click elsewhere can hand the
     /// keyboard straight back to it (`WordApp::refocus_after_chrome_click`).
     pub(crate) widget_id: Option<(egui::Id, u64)>,
@@ -249,6 +253,7 @@ impl Default for CanvasState {
             canvas_rect: None,
             focused: false,
             ime_wanted: !cfg!(target_os = "android"),
+            soft_keyboard_request: 0,
             widget_id: None,
             render_ms: 0.0,
             ime_preedit: String::new(),
@@ -1622,12 +1627,16 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     // while the canvas does not, and does not interrupt an editor that already has it.
     let keyboard_click = ui.memory(|m| m.has_focus(resp.id)) && ui.input(|i| i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter));
     let pointer_click = resp.clicked_by(egui::PointerButton::Primary);
+    let pointer_tap = pointer_click && resp.interact_pointer_pos().is_some();
     let accesskit_click = resp.clicked() && !pointer_click && !keyboard_click;
     let focus_click = pointer_click || accesskit_click || resp.drag_started();
-    // Android: a touch on the page asks for the soft keyboard. Space and Enter on a hardware
-    // keyboard also look like a primary click to egui, but must not open Gboard. A ribbon click
-    // restores keyboard focus without reopening it (`WordApp::refocus_after_chrome_click`).
-    if (pointer_click && resp.interact_pointer_pos().is_some()) || accesskit_click || resp.drag_started() {
+    // Android: only a real tap on the page asks for the soft keyboard. Space and Enter on a
+    // hardware keyboard also look like a click to egui, but must not open Gboard; a drag (a
+    // flick, a scroll or a selection) starts editing without it; and a ribbon click keeps the
+    // keyboard as it is (`WordApp::refocus_after_chrome_click`). The count lets the host show it
+    // again for each tap, even though `ime_wanted` only says it should be up.
+    if pointer_tap {
+        app.canvas.soft_keyboard_request = app.canvas.soft_keyboard_request.saturating_add(1);
         app.canvas.ime_wanted = true;
     }
     if focus_click || (app.canvas.want_focus && !resp.has_focus()) {
