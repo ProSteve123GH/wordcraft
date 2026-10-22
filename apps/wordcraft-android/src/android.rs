@@ -17,7 +17,7 @@ use winit::platform::android::activity::AndroidApp;
 use winit::platform::android::activity::input::{ImeOptions, InputType, TextInputAction, TextInputState};
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::async_saves::{AsyncSaves, SaveOutcome};
-use wordcraft_ui_egui::{Inbox, MAX_RECENT, Services, UiState, WordApp};
+use wordcraft_ui_egui::{Inbox, Services, UiState, WordApp};
 
 /// eframe application adapter. Android has no desktop-style title bar or native menu; the egui
 /// front end draws the whole window.
@@ -27,12 +27,15 @@ struct AndroidShell {
     inbox: Inbox,
     saves: AsyncSaves,
     prefs: PrefsStore,
+    /// The last `Canvas::soft_keyboard_request` seen. A page tap bumps it, and only then does the
+    /// host ask Android to show the keyboard again (after Back, or after it was dismissed).
+    last_soft_keyboard_request: u64,
 }
 
 impl AndroidShell {
     fn new(app: WordApp, android: AndroidApp, inbox: Inbox, saves: AsyncSaves, prefs: PrefsStore) -> Self {
         let ime = ImeBridge::new(android);
-        Self { app, ime, inbox, saves, prefs }
+        Self { app, ime, inbox, saves, prefs, last_soft_keyboard_request: 0 }
     }
 
     /// Moves bytes and save outcomes from the Java picker threads into the app's own queues.
@@ -76,16 +79,20 @@ impl AndroidShell {
     }
 
     /// A document written through SAF is the document the app is editing: its display name
-    /// becomes the title and a Recent entry. `session.path` is only a name on Android; writes
-    /// always go through the current SAF URI held by Java.
+    /// becomes the title. `session.path` is only a name on Android; writes always go through the
+    /// current SAF URI held by Java. Recent files need a stored URI to reopen, which this arc
+    /// does not have yet, so they are deliberately not added here.
     fn note_saved_document(&mut self, name: &str) {
         let Some(name) = clean_name(name) else { return };
         self.app.session.path = Some(PathBuf::from(&name));
-        if self.app.ui.recent.first().map(String::as_str) != Some(name.as_str()) {
-            self.app.ui.recent.retain(|r| r != &name);
-            self.app.ui.recent.insert(0, name);
-            self.app.ui.recent.truncate(MAX_RECENT);
-        }
+    }
+}
+
+impl Drop for AndroidShell {
+    fn drop(&mut self) {
+        // A system-initiated Activity destroy exits eframe without `quit_requested`; keep the
+        // settings the last periodic write may have missed. Document recovery is separate.
+        self.prefs.save_now(&self.app);
     }
 }
 
@@ -107,6 +114,14 @@ impl eframe::App for AndroidShell {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         self.app.raw_input_hook(raw);
         self.ime.poll(&mut raw.events);
+        // A real page tap asks for the keyboard even when Android hid it with Back: egui's
+        // `o.ime` allowance does not change in that case, so `show_soft_input` is called
+        // explicitly. Scrolling and ribbon taps never bump the counter.
+        let request = self.app.canvas.soft_keyboard_request;
+        if request != self.last_soft_keyboard_request {
+            self.last_soft_keyboard_request = request;
+            self.ime.show_soft_keyboard();
+        }
         // The soft keyboard has no text field of its own in the document: the document canvas
         // decides when Android should show it. Leaving the page for the ribbon drops a
         // composition that Gboard has not committed rather than typing it later.
@@ -117,6 +132,12 @@ impl eframe::App for AndroidShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
+        // Show it in the same frame as the tap instead of waiting for the next input pass.
+        let request = self.app.canvas.soft_keyboard_request;
+        if request != self.last_soft_keyboard_request {
+            self.last_soft_keyboard_request = request;
+            self.ime.show_soft_keyboard();
+        }
     }
 }
 
@@ -134,6 +155,11 @@ struct ImeBridge {
 }
 
 impl ImeBridge {
+    fn show_soft_keyboard(&self) {
+        // `false` asks for the keyboard now instead of only when Android considers it implicit.
+        self.android.show_soft_input(false);
+    }
+
     fn new(android: AndroidApp) -> Self {
         // Text mode: sentences, autocorrect, multiple lines. Enter is a line break, not a form
         // action. Ask IMEs not to cover the whole screen with their extracted editor.
@@ -549,14 +575,7 @@ pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeSaveResul
             let name = name.try_to_string(&*env)?;
             let uri = uri.try_to_string(&*env)?;
             let error = error.try_to_string(&*env)?;
-            push_save(SaveResult {
-                ticket: ticket.max(0) as u64,
-                ok: ok != 0,
-                cancelled: cancelled != 0,
-                name,
-                uri,
-                error,
-            });
+            push_save(SaveResult { ticket: ticket.max(0) as u64, ok: ok != 0, cancelled: cancelled != 0, name, uri, error });
             repaint_ui();
             Ok(())
         })
@@ -573,6 +592,8 @@ pub fn android_main(app: AndroidApp) {
     android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("WordCraft"));
     log::info!("WordCraft Android starting");
 
+    let data_dir = app.internal_data_path();
+    let android_for_services = app.clone();
     let android_for_ui = app.clone();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("WordCraft").with_inner_size([1200.0, 800.0]),
@@ -584,15 +605,25 @@ pub fn android_main(app: AndroidApp) {
     let result = eframe::run_native(
         "WordCraft",
         options,
-        Box::new(move |_cc| {
-            let mut session = Session::new(wordcraft_engine::sample::sample_document());
-            session.system_region = wordcraft_ui_egui::i18n::system_region();
+        Box::new(move |cc| {
+            // JNI callbacks from the picker threads wake the UI through this context.
+            set_ui_context(cc.egui_ctx.clone());
+            let inbox = Inbox::default();
+            let saves = AsyncSaves::default();
+            let services = android_services(&android_for_services, inbox.clone(), saves.clone());
+            let mut prefs = PrefsStore::new(data_dir);
 
-            let mut app = WordApp::new(session, Services::default());
-            // M-A0 has no document URI yet. AutoSave stays off so the sample document never
-            // tries to write a desktop path; SAF-backed AutoSave arrives with the storage arc.
+            // Android starts on File > Home, not on a built-in sample. The placeholder document
+            // stays hidden until Blank document or Open creates or replaces it.
+            let mut session = Session::new(wordcraft_engine::doc::Document::new());
+            session.system_region = wordcraft_ui_egui::i18n::system_region();
+            let mut app = WordApp::new(session, services);
+            prefs.restore(&mut app);
+            app.start_screen();
+            // SAF save writes through `download`; AutoSave stays off until it can reuse the
+            // current document URI safely on every path.
             app.autosave = false;
-            Ok(Box::new(AndroidShell::new(app, android_for_ui)))
+            Ok(Box::new(AndroidShell::new(app, android_for_ui, inbox, saves, prefs)))
         }),
     );
 

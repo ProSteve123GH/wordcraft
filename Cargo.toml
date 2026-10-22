@@ -115,3 +115,9 @@ strip = "symbols"
 # Required by craft-pdf: the backend rejects writers that failed during unwinding.
 [patch.crates-io]
 krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8" }
+
+# winit 0.30.13 never exits `android_main` when Android destroys the Activity, so GameActivity's
+# `onDestroy` waits forever for the native thread and the next launch is black until the process is
+# killed (winit #4303, android-activity #196). This upstream-ready patch exits the event loop on
+# `MainEvent::Destroy` and lets a recreated Activity build a new event loop.
+winit = { git = "https://github.com/rib/winit", rev = "c28e425214e82bdb86dcdf89c9488554a18e24b2" }

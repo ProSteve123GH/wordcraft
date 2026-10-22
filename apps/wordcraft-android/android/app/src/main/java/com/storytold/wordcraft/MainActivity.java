@@ -82,6 +82,7 @@ public final class MainActivity extends GameActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        Log.i(TAG, "onCreate " + this + " task=" + getTaskId());
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         hideSystemBars();
     }
@@ -104,6 +105,37 @@ public final class MainActivity extends GameActivity {
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
         getWindow().setStatusBarColor(Color.TRANSPARENT);
         getWindow().setNavigationBarColor(Color.TRANSPARENT);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        Log.i(TAG, "onStart " + this);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        Log.i(TAG, "onResume " + this);
+    }
+
+    @Override
+    protected void onPause() {
+        Log.i(TAG, "onPause " + this);
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        Log.i(TAG, "onStop " + this);
+        super.onStop();
+    }
+
+    @Override
+    protected void onDestroy() {
+        Log.i(TAG, "onDestroy entered " + this + " changing=" + isChangingConfigurations());
+        super.onDestroy();
+        Log.i(TAG, "onDestroy returned " + this);
     }
 
     // ------------------------------------------------------------------------------------
