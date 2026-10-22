@@ -25,3 +25,5 @@ eframe = { workspace = true, default-features = false, features = [
 winit = { workspace = true, features = ["android-game-activity"] }
 log = { workspace = true }
 android_logger = "0.15"
+jni = "0.22"
+serde_json = { workspace = true }
