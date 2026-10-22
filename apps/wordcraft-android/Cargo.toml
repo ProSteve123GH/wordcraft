@@ -1,0 +1,27 @@
+[package]
+name = "wordcraft-android"
+description = "WordCraft for Android tablets (GameActivity + eframe/wgpu)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "wordcraft_android"
+crate-type = ["cdylib"]
+
+# This crate is Android-only. Keeping every dependency target-scoped lets the
+# workspace's ordinary host checks build it as an empty cdylib instead of
+# pulling eframe/winit/NDK code into a desktop `cargo test` run.
+[target.'cfg(target_os = "android")'.dependencies]
+wordcraft-engine = { workspace = true }
+wordcraft-ui-egui = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true, default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "android-game-activity",
+] }
+winit = { workspace = true, features = ["android-game-activity"] }
+log = { workspace = true }
+android_logger = "0.15"

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- GameActivity derives from AppCompatActivity, so the activity theme must be AppCompat-based.
+         These colours are WordCraft's own; no Microsoft theme assets are used. -->
+    <style name="Theme.WordCraft" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#FFF7F7F7</item>
+        <item name="android:statusBarColor">#FFF7F7F7</item>
+        <item name="android:navigationBarColor">#FFF7F7F7</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="android:colorAccent">#FF1F6FEB</item>
+        <item name="android:fontFamily">sans</item>
+    </style>
+</resources>

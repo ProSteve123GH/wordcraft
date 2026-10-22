@@ -1,0 +1,60 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.storytold.wordcraft'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'com.storytold.wordcraft'
+        minSdk 26
+        targetSdk 36
+        versionCode 1
+        versionName '0.8.0-android.1'
+
+        ndk {
+            // M-A0 is tablet/arm64 first. The emulator and 32-bit ABIs come later.
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+            shrinkResources false
+            // CI publishes an unsigned release APK until the signing owner decision is made.
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        buildConfig false
+        viewBinding false
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
+    lint {
+        abortOnError true
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    // GameActivity is the Android host. It derives from AppCompat, so the app needs a compatible
+    // theme and the AppCompat runtime even though our activity has no Java UI of its own.
+    implementation 'androidx.games:games-activity:4.4.0'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+}

@@ -1,0 +1,80 @@
+name: Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'android/**'
+    paths:
+      - 'apps/wordcraft-android/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: arm64 debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          cache-on-failure: true
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build native library
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/29.0.14206865"
+          cargo ndk \
+            --platform 26 \
+            -t arm64-v8a \
+            -o apps/wordcraft-android/android/app/src/main/jniLibs \
+            build --profile android -p wordcraft-android
+          ls -lh apps/wordcraft-android/android/app/src/main/jniLibs/arm64-v8a/
+
+      - name: Assemble debug APK
+        working-directory: apps/wordcraft-android/android
+        run: |
+          ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wordcraft-android-arm64-debug
+          path: apps/wordcraft-android/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
