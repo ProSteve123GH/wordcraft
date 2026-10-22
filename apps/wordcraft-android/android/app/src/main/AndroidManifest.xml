@@ -19,7 +19,7 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|locale|layoutDirection"
             android:exported="true"
             android:screenOrientation="fullSensor"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize|stateAlwaysHidden">
 
             <!-- Read by com.google.androidgamesdk.GameActivity. The Rust cdylib is
                  libwordcraft_android.so. -->

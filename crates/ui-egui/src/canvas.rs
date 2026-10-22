@@ -88,6 +88,10 @@ pub struct CanvasState {
     pub scale: f32,
     pub canvas_rect: Option<Rect>,
     pub focused: bool,
+    /// Android asks for the soft keyboard when the page is tapped, not merely when it has focus.
+    /// The page keeps keyboard focus after a ribbon click (typing continues where it was), but the
+    /// soft keyboard stays down until the page itself is touched.
+    pub ime_wanted: bool,
     /// The page's widget id and the pass that last drew it, so a click elsewhere can hand the
     /// keyboard straight back to it (`WordApp::refocus_after_chrome_click`).
     pub(crate) widget_id: Option<(egui::Id, u64)>,
@@ -244,6 +248,7 @@ impl Default for CanvasState {
             scale: PX_PER_PT,
             canvas_rect: None,
             focused: false,
+            ime_wanted: !cfg!(target_os = "android"),
             widget_id: None,
             render_ms: 0.0,
             ime_preedit: String::new(),
@@ -1499,15 +1504,17 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 }
                 if focused {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(530 - (since as u64 % 530)));
-                    let cr = Rect::from_min_max(pos2(x, y0), pos2(x + 1.0, y1));
-                    ui.ctx().output_mut(|o| {
-                        o.ime = Some(egui::output::IMEOutput {
-                            rect: cr,
-                            cursor_rect: cr,
-                            purpose: Default::default(),
-                            should_interrupt_composition: ime_reset,
+                    if app.canvas.ime_wanted {
+                        let cr = Rect::from_min_max(pos2(x, y0), pos2(x + 1.0, y1));
+                        ui.ctx().output_mut(|o| {
+                            o.ime = Some(egui::output::IMEOutput {
+                                rect: cr,
+                                cursor_rect: cr,
+                                purpose: Default::default(),
+                                should_interrupt_composition: ime_reset,
+                            });
                         });
-                    });
+                    }
                 }
             }
         }
@@ -1540,8 +1547,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(530 - (since as u64 % 530)));
             }
             // IME candidate window placement.
-            let cr = Rect::from_min_max(pos2(x, y0), pos2(x + 1.0, y1));
-            if focused {
+            if focused && app.canvas.ime_wanted {
+                let cr = Rect::from_min_max(pos2(x, y0), pos2(x + 1.0, y1));
                 ui.ctx().output_mut(|o| {
                     o.ime = Some(egui::output::IMEOutput {
                         rect: cr,
@@ -1617,6 +1624,11 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let pointer_click = resp.clicked_by(egui::PointerButton::Primary);
     let accesskit_click = resp.clicked() && !pointer_click && !keyboard_click;
     let focus_click = pointer_click || accesskit_click || resp.drag_started();
+    if focus_click {
+        // Android: a touch on the page asks for the soft keyboard. A ribbon click restores focus
+        // without reopening it (`WordApp::refocus_after_chrome_click`).
+        app.canvas.ime_wanted = true;
+    }
     if focus_click || (app.canvas.want_focus && !resp.has_focus()) {
         resp.request_focus();
     }

@@ -2300,6 +2300,11 @@ impl WordApp {
         if self.canvas.balloon.is_some() || self.canvas.viewport.is_some_and(|v| v.contains(pos)) {
             return;
         }
+        // Android: touching the ribbon, a pane or the status bar puts the soft keyboard away. A
+        // focused text field still asks for it through its own `IMEOutput`.
+        if cfg!(target_os = "android") {
+            self.canvas.ime_wanted = false;
+        }
         let on_chrome = ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background);
         if on_chrome && ctx.memory(|m| m.focused().is_none()) && !egui::Popup::is_any_open(ctx) {
             self.canvas.want_focus = true;
