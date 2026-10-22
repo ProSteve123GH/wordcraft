@@ -469,11 +469,11 @@ fn is_export_name(name: &str) -> bool {
 }
 
 fn launch_open(android: &AndroidApp, purpose: &str) {
-    let android = android.clone();
+    let callback = android.clone();
     let purpose = purpose.to_string();
     let multiple = purpose == "font";
     android.run_on_java_main_thread(Box::new(move || {
-        with_activity(&android, |env, activity| {
+        with_activity(&callback, |env, activity| {
             let purpose = JString::new(env, &purpose)?;
             env.call_method(
                 activity,
@@ -487,11 +487,11 @@ fn launch_open(android: &AndroidApp, purpose: &str) {
 }
 
 fn launch_save(android: &AndroidApp, bytes: &[u8], name: &str, set_current: bool, force_picker: bool, ticket: u64) {
-    let android = android.clone();
+    let callback = android.clone();
     let bytes = bytes.to_vec();
     let name = name.to_string();
     android.run_on_java_main_thread(Box::new(move || {
-        with_activity(&android, |env, activity| {
+        with_activity(&callback, |env, activity| {
             let data = env.byte_array_from_slice(&bytes)?;
             let name = JString::new(env, &name)?;
             env.call_method(
@@ -575,7 +575,7 @@ pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeSaveResul
             let name = name.try_to_string(&*env)?;
             let uri = uri.try_to_string(&*env)?;
             let error = error.try_to_string(&*env)?;
-            push_save(SaveResult { ticket: ticket.max(0) as u64, ok: ok != 0, cancelled: cancelled != 0, name, uri, error });
+            push_save(SaveResult { ticket: ticket.max(0) as u64, ok, cancelled, name, uri, error });
             repaint_ui();
             Ok(())
         })
