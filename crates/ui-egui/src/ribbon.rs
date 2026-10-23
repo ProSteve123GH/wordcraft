@@ -27,7 +27,7 @@ pub fn has_shape_selected(s: &wordcraft_engine::Session) -> bool {
 /// Reading controls replace editing tabs entirely. All settings are transient view controls.
 fn reading_toolbar(app: &mut WordApp, ui: &mut Ui, t: Tokens) {
     egui::Panel::top("reading_toolbar")
-        .exact_size(46.0)
+        .exact_size(if app.services.touch { 54.0 } else { 46.0 })
         .frame(egui::Frame::NONE.fill(t.ribbon).inner_margin(egui::Margin::symmetric(12, 6)).stroke(Stroke::new(1.0, t.border)))
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
@@ -248,6 +248,9 @@ pub fn in_table_public(app: &WordApp) -> bool {
 
 pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
+    let touch = app.services.touch;
+    let tab_h = if touch { crate::theme::TOUCH_TAB_H } else { 30.0 };
+    let content_h = if touch { crate::theme::TOUCH_CONTENT_H } else { CONTENT_H };
     if app.session.view.read_mode {
         reading_toolbar(app, ui, t);
         return;
@@ -297,7 +300,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     }
     // Tab strip.
     egui::Panel::top("tabs")
-        .exact_size(30.0)
+        .exact_size(tab_h)
         .frame(egui::Frame::NONE.fill(t.tab_strip).inner_margin(egui::Margin { left: 8, right: 10, top: 0, bottom: 0 }))
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
@@ -312,7 +315,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 let button_widths = |level: usize| -> f32 {
                     let labels = level == 0;
                     let share_full = (share_w + 36.0).max(74.0);
-                    let share_button = if level < 2 { share_full } else { 30.0 };
+                    let share_button = if level < 2 {
+                        share_full
+                    } else if touch {
+                        tab_h - 8.0
+                    } else {
+                        30.0
+                    };
                     let editing = crate::widgets::icon_text_button_width(ui, editing_label, regular(12.0), true, labels);
                     let comment = crate::widgets::icon_text_button_width(ui, comments, regular(12.0), false, labels);
                     // The gaps (6 + 4 + 8) and the strip's margin.
@@ -337,8 +346,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     // tabs took clicks that did nothing, so the empty window had no way back to
                     // the Start screen (#3045).
                     ui.add_enabled_ui(app.has_document(), |ui| {
-                        let (share_size, share_text) =
-                            if plan.buttons < 2 { (((share_w + 36.0).max(74.0), 24.0), true) } else { ((30.0, 24.0), false) };
+                        let (share_size, share_text) = if plan.buttons < 2 {
+                            (((share_w + 36.0).max(74.0), tab_h - 6.0), true)
+                        } else if touch {
+                            ((tab_h - 8.0, tab_h - 6.0), false)
+                        } else {
+                            ((30.0, 24.0), false)
+                        };
                         let (r, resp) = ui.allocate_exact_size(vec2(share_size.0, share_size.1), Sense::click());
                         ui.painter().rect_filled(r, 4.0, if resp.hovered() { t.accent_text } else { t.accent });
                         let icon_x = if share_text { r.min.x + 14.0 } else { r.center().x };
@@ -393,7 +407,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                             let shown = if custom { tab } else { tl!(tab) };
                             let w = plan.widths.get(i).copied().unwrap_or(0.0) - 2.0;
                             let cut = specs.get(i).is_some_and(|sp| sp.text_w + plan.pad > w + 0.5);
-                            let (r, resp) = ui.allocate_exact_size(vec2(w, 30.0), Sense::click());
+                            let (r, resp) = ui.allocate_exact_size(vec2(w, tab_h), Sense::click());
                             if app.ui.keytips == crate::keytips::Phase::Tabs {
                                 crate::keytips::record_tab(r, tab, &app.ui.keytip_prefix, &mut app.keytip_rects);
                             }
@@ -446,7 +460,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                             .map(|(((tab, _), shown), _)| (tab.as_str(), *shown))
                             .collect();
                         if !left_out.is_empty() {
-                            let (r, resp) = ui.allocate_exact_size(vec2(MORE_TABS_W, 30.0), Sense::click());
+                            let (r, resp) = ui.allocate_exact_size(vec2(MORE_TABS_W, tab_h), Sense::click());
                             if resp.hovered() {
                                 ui.painter().rect_filled(r.shrink2(vec2(0.0, 4.0)), 4.0, t.hover);
                             }
@@ -476,7 +490,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         return;
     }
     egui::Panel::top("ribbon")
-        .exact_size(CONTENT_H + LABEL_H + 10.0)
+        .exact_size(content_h + LABEL_H + 10.0)
         .frame(
             egui::Frame::NONE.fill(t.ribbon).inner_margin(egui::Margin { left: 8, right: 8, top: 4, bottom: 4 }).stroke(Stroke::new(1.0, t.border)),
         )

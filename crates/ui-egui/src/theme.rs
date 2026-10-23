@@ -724,6 +724,98 @@ pub fn apply(ctx: &egui::Context, appearance: Appearance) {
     });
 }
 
+/// Ribbon content height with fingers on a tablet: three [`TOUCH_ROW_H`] rows plus spacing, so
+/// the small buttons stay inside the group. Desktop keeps [`crate::widgets::CONTENT_H`].
+pub const TOUCH_CONTENT_H: f32 = 76.0;
+/// Height of a small ribbon button's tap target in touch mode.
+pub const TOUCH_ROW_H: f32 = 24.0;
+/// Height of the ribbon tab strip in touch mode (desktop is 30).
+pub const TOUCH_TAB_H: f32 = 38.0;
+
+/// Page transitions and small fades on Android. Times are in seconds; every one goes through
+/// [`Animations`](crate::theme::Animations), so Animation effects off draws the same places and
+/// colours with no motion.
+pub const PAGE_SLIDE_SECS: f64 = 0.22;
+/// A dirty dot fading in, or out after a save.
+pub const DOT_FADE_SECS: f64 = 0.30;
+/// The title's soft pulse just after a save or AutoSave.
+pub const PULSE_SECS: f64 = 0.55;
+/// The welcome mark drawing itself in.
+pub const MARK_DRAW_SECS: f64 = 0.55;
+
+/// How far a transition that started at `started` and lasts `secs` has run at `now`: 0 to 1 with
+/// an ease-out curve, or 1 at once when animation effects are off.
+pub fn motion(now: f64, started: f64, secs: f64, animate: bool) -> f32 {
+    if !animate {
+        return 1.0;
+    }
+    let t = ((now - started) / secs).clamp(0.0, 1.0);
+    if !t.is_finite() {
+        return 1.0;
+    }
+    ease_out(t as f32)
+}
+
+/// A fade from 0 to 1 (when `on`) or 1 to 0 (`on` false) that began at `started`, at rest when it
+/// has finished. With animation effects off the end state shows at once.
+pub fn fade(now: f64, started: f64, secs: f64, animate: bool, on: bool) -> f32 {
+    if !animate {
+        return if on { 1.0 } else { 0.0 };
+    }
+    let t = motion(now, started, secs, animate);
+    if on { t } else { 1.0 - t }
+}
+
+/// A soft 0 → 1 → 0 pulse after a save; 0 at rest, and 0 with animation effects off.
+pub fn pulse(now: f64, started: f64, secs: f64, animate: bool) -> f32 {
+    if !animate {
+        return 0.0;
+    }
+    let t = ((now - started) / secs).clamp(0.0, 1.0);
+    if !t.is_finite() || t >= 1.0 {
+        return 0.0;
+    }
+    let t = t as f32;
+    if t < 0.5 { ease_out(t * 2.0) } else { ease_out((1.0 - t) * 2.0) }
+}
+
+/// Ease-out for slides: fast at first, settling at the end.
+fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t) * (1.0 - t)
+}
+
+/// Larger tap targets, spacing and type for fingers on an Android tablet; the desktop and web
+/// layouts are untouched. Called after [`apply`], which installs the mouse-sized spacing.
+pub fn apply_touch(ctx: &egui::Context, touch: bool) {
+    ctx.all_styles_mut(|s| {
+        if touch {
+            s.spacing.item_spacing = egui::vec2(10.0, 8.0);
+            s.spacing.button_padding = egui::vec2(16.0, 11.0);
+            s.spacing.interact_size = egui::vec2(44.0, 44.0);
+            s.spacing.menu_margin = egui::Margin::same(10);
+            s.spacing.scroll.bar_width = 12.0;
+            s.text_styles.insert(egui::TextStyle::Body, regular(14.0));
+            s.text_styles.insert(egui::TextStyle::Button, regular(14.0));
+            s.text_styles.insert(egui::TextStyle::Small, regular(12.0));
+            s.text_styles.insert(egui::TextStyle::Heading, semibold(19.0));
+            s.interaction.tooltip_delay = 0.35;
+        } else {
+            s.spacing.item_spacing = egui::vec2(6.0, 4.0);
+            s.spacing.button_padding = egui::vec2(8.0, 3.0);
+            s.spacing.interact_size = egui::vec2(24.0, 22.0);
+            s.spacing.menu_margin = egui::Margin::same(6);
+            // egui's floating default; the touch layout widens it to 12.
+            s.spacing.scroll.bar_width = 10.0;
+            s.text_styles.insert(egui::TextStyle::Body, regular(12.5));
+            s.text_styles.insert(egui::TextStyle::Button, regular(12.5));
+            s.text_styles.insert(egui::TextStyle::Small, regular(10.5));
+            s.text_styles.insert(egui::TextStyle::Heading, semibold(17.0));
+            s.interaction.tooltip_delay = 0.45;
+        }
+    });
+}
+
 /// Turn egui's own animations on or off: hover and press fades, menus, tooltips and windows fading
 /// in, sections sliding open, and the glide when a scroll area brings the caret or a list item
 /// into view. Off, each of them happens at once.
@@ -929,6 +1021,64 @@ mod tests {
                 assert!(!src.contains(b), "{name} hard-codes {b}; use theme::Tokens");
             }
         }
+    }
+
+    /// Motion honours the Animation effects setting: easing runs 0 → 1 over its time with them on,
+    /// and the end state shows at once with them off. Junk times never leave the range.
+    #[test]
+    fn motion_fades_and_pulses_follow_the_animation_setting() {
+        // Slide/fade: starts at 0, ends at 1, and is between the two in the middle.
+        assert_eq!(super::motion(10.0, 10.0, super::PAGE_SLIDE_SECS, true), 0.0);
+        assert!((super::motion(10.0 + super::PAGE_SLIDE_SECS / 2.0, 10.0, super::PAGE_SLIDE_SECS, true) - 0.75).abs() < 1e-3);
+        assert_eq!(super::motion(11.0, 10.0, super::PAGE_SLIDE_SECS, true), 1.0, "settled");
+        assert_eq!(super::motion(10.0, 10.0, super::PAGE_SLIDE_SECS, false), 1.0, "no animation: at rest at once");
+
+        // A dirty dot fades in when `on`, out when not, and is at rest without animation.
+        assert_eq!(super::fade(20.0, 20.0, super::DOT_FADE_SECS, true, true), 0.0);
+        assert_eq!(super::fade(21.0, 20.0, super::DOT_FADE_SECS, true, true), 1.0);
+        assert_eq!(super::fade(20.0, 20.0, super::DOT_FADE_SECS, true, false), 1.0);
+        assert_eq!(super::fade(21.0, 20.0, super::DOT_FADE_SECS, true, false), 0.0);
+        assert_eq!(super::fade(20.0, 20.0, super::DOT_FADE_SECS, false, true), 1.0);
+        assert_eq!(super::fade(20.0, 20.0, super::DOT_FADE_SECS, false, false), 0.0);
+
+        // The save pulse rises and falls inside its window, is silent at rest and with animation off.
+        assert_eq!(super::pulse(30.0, 30.0, super::PULSE_SECS, true), 0.0);
+        assert!(super::pulse(30.0 + super::PULSE_SECS / 2.0, 30.0, super::PULSE_SECS, true) > 0.0);
+        assert_eq!(super::pulse(31.0, 30.0, super::PULSE_SECS, true), 0.0);
+        assert_eq!(super::pulse(30.25, 30.0, super::PULSE_SECS, false), 0.0, "no pulse without animation");
+
+        // Hostile times (a stalled or reset clock) never panic and never leave 0..=1.
+        for t in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let m = super::motion(t, 0.0, super::PAGE_SLIDE_SECS, true);
+            assert!(m.is_finite() && (0.0..=1.0).contains(&m), "motion({t}) = {m}");
+            let p = super::pulse(t, 0.0, super::PULSE_SECS, true);
+            assert!(p.is_finite() && (0.0..=1.0).contains(&p), "pulse({t}) = {p}");
+        }
+    }
+
+    /// Touch mode enlarges what a finger hits and the type it reads, and the mouse layout comes
+    /// back exactly (the web and desktop keep their compact chrome).
+    #[test]
+    fn touch_style_sizes_for_fingers_and_restores_the_mouse_layout() {
+        let ctx = egui::Context::default();
+        // The app's order: the palette installs the mouse-sized spacing, then touch goes on top.
+        super::apply(&ctx, super::Appearance::Light);
+        let mouse = ctx.style_of(egui::Theme::Light).spacing.clone();
+        super::apply_touch(&ctx, true);
+        let touch = ctx.style_of(egui::Theme::Light).spacing.clone();
+        assert!(touch.interact_size.x >= 44.0 && touch.interact_size.y >= 44.0, "44 pt tap targets: {:?}", touch.interact_size);
+        assert!(touch.button_padding.y > mouse.button_padding.y, "roomier buttons");
+        assert!(touch.scroll.bar_width > mouse.scroll.bar_width, "a wider scrollbar to grab");
+        assert!(touch.item_spacing.x > mouse.item_spacing.x && touch.item_spacing.y > mouse.item_spacing.y, "more space between targets");
+        assert!(super::TOUCH_CONTENT_H > crate::widgets::CONTENT_H, "the ribbon row grows");
+        assert!(super::TOUCH_ROW_H > 22.0 && super::TOUCH_TAB_H > 30.0);
+
+        super::apply_touch(&ctx, false);
+        let back = ctx.style_of(egui::Theme::Light).spacing.clone();
+        assert_eq!(back.interact_size, mouse.interact_size);
+        assert_eq!(back.button_padding, mouse.button_padding);
+        assert_eq!(back.item_spacing, mouse.item_spacing);
+        assert_eq!(back.scroll.bar_width, mouse.scroll.bar_width);
     }
 
     /// Symbols written as text in the interface code must exist in the interface fonts (Inter and

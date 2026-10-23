@@ -4,11 +4,15 @@ import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.View;
+import android.window.OnBackInvokedDispatcher;
 
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -82,8 +86,9 @@ public final class MainActivity extends GameActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        Log.i(TAG, "onCreate " + this + " task=" + getTaskId());
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+        installInsetsListener();
+        installBackCallback();
         hideSystemBars();
     }
 
@@ -93,6 +98,51 @@ public final class MainActivity extends GameActivity {
         if (hasFocus) {
             hideSystemBars();
         }
+    }
+
+    /**
+     * Reports the system bars and display cutout to Rust, in device-independent pixels. The Rust
+     * host puts them in {@code RawInput::safe_area_insets}, so the ribbon, page and status bar
+     * never sit under the cutout, the status bar or the navigation/gesture area. IME visibility
+     * lets Back hide the keyboard before it goes on to the document.
+     */
+    private void installInsetsListener() {
+        View decor = getWindow().getDecorView();
+        ViewCompat.setOnApplyWindowInsetsListener(decor, (view, windowInsets) -> {
+            Insets bars = windowInsets.getInsets(
+                    WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            float density = getResources().getDisplayMetrics().density;
+            if (!(density > 0f)) {
+                density = 1f;
+            }
+            nativeInsets(bars.left / density, bars.top / density,
+                    bars.right / density, bars.bottom / density);
+            nativeImeVisible(windowInsets.isVisible(WindowInsetsCompat.Type.ime()));
+            return windowInsets;
+        });
+        ViewCompat.requestApplyInsets(decor);
+    }
+
+    /**
+     * Back goes to Rust: it hides the keyboard first, then closes the nearest dialog or page, and
+     * only then asks to close the document (Save Changes included). API 33+ uses the predictive
+     * back dispatcher; older releases deliver {@code onBackPressed}.
+     */
+    private void installBackCallback() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::requestBack);
+        }
+    }
+
+    private void requestBack() {
+        nativeBack();
+    }
+
+    @Override
+    @SuppressWarnings("deprecation")
+    public void onBackPressed() {
+        requestBack();
     }
 
     @SuppressWarnings("deprecation")
@@ -108,34 +158,21 @@ public final class MainActivity extends GameActivity {
     }
 
     @Override
-    protected void onStart() {
-        super.onStart();
-        Log.i(TAG, "onStart " + this);
-    }
-
-    @Override
     protected void onResume() {
         super.onResume();
-        Log.i(TAG, "onResume " + this);
+        // The bars may have been shown while another app was in front: hide them again and ask
+        // for fresh insets (the activity's size or orientation may also have changed).
+        hideSystemBars();
+        ViewCompat.requestApplyInsets(getWindow().getDecorView());
+        nativeResume();
     }
 
     @Override
     protected void onPause() {
-        Log.i(TAG, "onPause " + this);
+        // Settings are written now; the UI thread may not run another frame before the activity
+        // is suspended, and a later destroy or process death must not lose them.
+        nativePause();
         super.onPause();
-    }
-
-    @Override
-    protected void onStop() {
-        Log.i(TAG, "onStop " + this);
-        super.onStop();
-    }
-
-    @Override
-    protected void onDestroy() {
-        Log.i(TAG, "onDestroy entered " + this + " changing=" + isChangingConfigurations());
-        super.onDestroy();
-        Log.i(TAG, "onDestroy returned " + this);
     }
 
     // ------------------------------------------------------------------------------------
@@ -432,4 +469,15 @@ public final class MainActivity extends GameActivity {
 
     private static native void nativeSaveResult(
             long ticket, boolean ok, boolean cancelled, String name, String uri, String error);
+
+    private static native void nativeInsets(
+            float left, float top, float right, float bottom);
+
+    private static native void nativeImeVisible(boolean visible);
+
+    private static native void nativeBack();
+
+    private static native void nativePause();
+
+    private static native void nativeResume();
 }

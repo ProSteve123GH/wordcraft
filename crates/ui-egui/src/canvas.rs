@@ -1006,7 +1006,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let mut zoom_anchor = None;
     if (zoom_delta - 1.0).abs() > 1e-3 && ui.rect_contains_pointer(area) {
         let reading = app.session.view.read_mode;
-        if !reading && let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+        // A two-finger pinch keeps the point between the fingers in place; the wheel keeps the
+        // pointer's page point in place (there is no gesture centre).
+        let anchor_pos = ui.input(|i| i.multi_touch().map_or_else(|| i.pointer.latest_pos(), |m| Some(m.center_pos)));
+        if !reading && let Some(p) = anchor_pos {
             zoom_anchor = page_at(&app.canvas.page_rects, &layout, app.canvas.scale, p).map(|at| (p, at));
         }
         let pct = (app.canvas.scale / PX_PER_PT * zoom_delta * 100.0).clamp(if reading { 75.0 } else { 10.0 }, if reading { 150.0 } else { 500.0 });
@@ -1656,8 +1659,18 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     crate::a11y::expose(app, ui.ctx(), resp.id, &layout, &rects, area);
     // The buttons that start or stop middle-click scrolling don't also click the page.
     let middle_gesture = app.canvas.auto_scroll.blocks_input();
+    // Two fingers are a pan or pinch (`crate::scroll`). winit emulates the mouse from the first
+    // finger, so without this a pan would also drag-select, draw or toggle the page under it. One
+    // finger still edits; a text drag already under way ends here, as it would on release.
+    let panning = ui.input(|i| i.multi_touch().is_some());
+    if panning && app.canvas.dragging {
+        app.canvas.dragging = false;
+        app.canvas.column_drag = None;
+        app.canvas.unit_drag = None;
+    }
     // Double-click the space between two pages (or the line between them) to hide or show it.
     if resp.double_clicked()
+        && !panning
         && app.session.view.mode == wordcraft_layout::ViewMode::Print
         && !app.session.view.read_mode
         && let Some(p) = resp.interact_pointer_pos()
@@ -1666,11 +1679,11 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         let _ = app.run("view.hideWhiteSpace", json!({"value": !app.session.view.hide_white_space}));
     } else
     // Draw Table / Eraser own the mouse while on (no caret moves); else the usual editing.
-    if !middle_gesture && !crate::table_pen::pointer(app, ui, &resp, &rects, &layout, geo.scale) {
+    if !middle_gesture && !panning && !crate::table_pen::pointer(app, ui, &resp, &rects, &layout, geo.scale) {
         mouse(app, ui, &resp, &rects, &layout, geo.scale);
     }
     // A click on a check box ticks it; on a list's button opens the list.
-    if !middle_gesture {
+    if !middle_gesture && !panning {
         crate::content_controls::clicks(app, &resp);
     }
     let secondary_clicked = resp.secondary_clicked() && !middle_gesture;

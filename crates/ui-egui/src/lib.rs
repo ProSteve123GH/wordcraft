@@ -63,6 +63,7 @@ pub mod keys;
 pub mod keytips;
 pub mod mini_toolbar;
 pub mod objects;
+pub mod onboarding;
 pub mod options;
 pub mod panes;
 pub mod paste_picture;
@@ -145,6 +146,9 @@ pub struct Services {
     /// Asked every frame, so a change in the system's settings shows at once: the host answers
     /// from memory and does any slow asking elsewhere. Without the hook, animation effects stay on.
     pub animations_enabled: Option<Box<dyn Fn() -> Option<bool>>>,
+    /// The UI is used with fingers on a tablet (Android): larger tap targets and spacing, and a
+    /// taller ribbon tab strip. Desktop and web leave this off, so their layout is unchanged.
+    pub touch: bool,
     /// Desktop: the text on the system clipboard, if any. Ctrl+V gets it from egui's paste event;
     /// the ribbon and context-menu Paste read it here (#584).
     pub clipboard_text: Option<Box<dyn Fn() -> Option<String>>>,
@@ -337,6 +341,10 @@ pub struct UiState {
     /// File › Options › General: start on File › Home (Blank document, templates, Recent) when
     /// the app opens without a document (#766); on, as in Word. See [`WordApp::start_screen`].
     pub start_screen: bool,
+    /// The one-time welcome tour has been seen (Done or Skip). New Android installs start at
+    /// `false` (the host sets it when no `ui.json` exists); desktop and web default to `true`,
+    /// so their first run is unchanged. Options › General can show it again.
+    pub onboarding_done: bool,
     /// File › Options › Display: print the page colour (off, as in Word).
     pub print_backgrounds: bool,
     /// File › Options › Display: update fields (dates, page numbers, SEQ…) before printing.
@@ -402,6 +410,7 @@ impl Default for UiState {
             mini_toolbar: true,
             alignment_guides: true,
             start_screen: true,
+            onboarding_done: true,
             print_backgrounds: false,
             update_fields_before_print: false,
             dictionary: Vec::new(),
@@ -575,6 +584,15 @@ pub struct WordApp {
     system_animations: Option<bool>,
     /// Whether egui's own animations were last switched on or off ([`theme::apply_animations`]).
     applied_animations: Option<bool>,
+    /// Whether the touch-first spacing was last installed ([`theme::apply_touch`]).
+    applied_touch: Option<bool>,
+    /// The one-time welcome tour's page and its own timing ([`onboarding`]).
+    pub(crate) onboarding: onboarding::Onboarding,
+    /// The document's dirty state last frame and when it last became clean, for the title bar's
+    /// dirty dot fade and its save pulse (animation effects off: drawn at rest at once).
+    dirty_seen: bool,
+    dirty_changed: f64,
+    save_pulse: Option<f64>,
     pub frame_ms: f64,
     /// The window title last sent; a viewport command schedules a repaint, so only send changes.
     sent_title: String,
@@ -628,6 +646,16 @@ pub struct WordApp {
     no_document: Option<u64>,
     /// Comment and reply text typed but not yet written to the document (#1348).
     pub(crate) comment_drafts: panes::CommentDrafts,
+}
+
+/// What Android's Back gesture left for the host to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackGesture {
+    /// The nearest open thing (a dialog, the File page, a drop-down, keytips, a file picker) was
+    /// closed the way Escape closes it; Back is used up.
+    Dismissed,
+    /// Nothing was open: the host should ask to close the document/window, Save Changes included.
+    NothingOpen,
 }
 
 /// The answer to "Do you want to save changes?" (`ui.saveChanges`).
@@ -694,6 +722,11 @@ impl WordApp {
             applied_editing: None,
             system_animations: None,
             applied_animations: None,
+            applied_touch: None,
+            onboarding: onboarding::Onboarding::default(),
+            dirty_seen: false,
+            dirty_changed: 0.0,
+            save_pulse: None,
             frame_ms: 0.0,
             sent_title: String::new(),
             sent_full_screen: false,
@@ -1294,6 +1327,41 @@ impl WordApp {
         saved
     }
 
+    /// Android's Back gesture, after the host has put the soft keyboard away. Closes the nearest
+    /// thing the UI has open the way Escape does — each dialog's own cancellation runs (a Save
+    /// Changes prompt's Cancel, say), rather than this method discarding state behind its back.
+    ///
+    /// Returns [`BackGesture::NothingOpen`] only when there is nothing left to close, which is
+    /// the host's cue to ask to close the document/window through [`WordApp::close_requested`].
+    /// A dialog that doesn't close on Escape (none today) keeps the gesture here, safely.
+    pub fn back_gesture(&mut self, ctx: &egui::Context) -> BackGesture {
+        // The welcome tour is modal but not a dialog: Back leaves it the same way Skip does, so
+        // the gesture never closes the app behind a first-run screen.
+        if onboarding::visible(self) {
+            onboarding::dismiss(self);
+            ctx.request_repaint();
+            return BackGesture::Dismissed;
+        }
+        let open = self.dialog.is_some()
+            || self.colors.is_some()
+            || self.ui.backstage
+            || self.ui.keytips != keytips::Phase::Off
+            || self.file_dialog_open()
+            || egui::Popup::is_any_open(ctx);
+        if !open {
+            return BackGesture::NothingOpen;
+        }
+        // The UI already understands Escape for every one of these (a dialog's Cancel, the File
+        // page's back arrow, an open drop-down, keytips), so drive that one path instead of
+        // closing state here: the Save Changes prompt, for one, must go through `ui.saveChanges`
+        // so the close it was asked about is held or released properly.
+        let modifiers = egui::Modifiers::default();
+        self.synthetic.push(egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers });
+        self.synthetic.push(egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: false, repeat: false, modifiers });
+        ctx.request_repaint();
+        BackGesture::Dismissed
+    }
+
     /// The window's close button (or the system) asked to quit. Returns true to let the window
     /// close; with unsaved changes it asks first and returns false.
     pub fn close_requested(&mut self) -> bool {
@@ -1709,6 +1777,19 @@ impl WordApp {
                 }
                 json!({"alignmentGuides": self.ui.alignment_guides})
             }
+            "ui.onboarding" => {
+                // File › Options › General › Show the welcome tour again, and the tour's own
+                // Skip/Done. No value reads it; `true` reopens it at the first page, `false`
+                // finishes it (Back does the same).
+                match p.get("value") {
+                    None if onboarding::visible(self) => onboarding::dismiss(self),
+                    None => onboarding::open(self),
+                    Some(Value::Bool(true)) => onboarding::open(self),
+                    Some(Value::Bool(false)) => onboarding::dismiss(self),
+                    Some(_) => return Some(Err("`value` must be true or false".into())),
+                }
+                json!({"onboarding": onboarding::visible(self), "done": self.ui.onboarding_done})
+            }
             "ui.startScreen" => {
                 // File › Options › General › Start-up (#766): `value` true or false turns showing
                 // File › Home at start-up on or off; no value reads it.
@@ -1980,6 +2061,13 @@ impl WordApp {
         if self.applied_theme != Some(effective) {
             theme::apply(ctx, effective);
             self.applied_theme = Some(effective);
+            // `apply` installs the mouse-sized spacing; the touch layout goes back on top.
+            self.applied_touch = None;
+        }
+        let touch = self.services.touch;
+        if self.applied_touch != Some(touch) {
+            theme::apply_touch(ctx, touch);
+            self.applied_touch = Some(touch);
         }
         // Interface size (#475, #822): egui's zoom factor multiplies the display scale the system
         // reports (native pixels per point). Auto keeps that scale; a chosen size divides it back
@@ -2187,10 +2275,87 @@ impl WordApp {
         raw.events.extend(self.synthetic.drain(..n));
     }
 
+    /// Notice a document becoming clean (a save or AutoSave) so the title bar can pulse, and a
+    /// document becoming dirty so its dirty dot can fade in. Times are the input clock's seconds.
+    fn note_save_feedback(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        let dirty = self.has_document() && self.session.dirty;
+        if self.dirty_seen && !dirty && self.has_document() {
+            self.save_pulse = Some(now);
+        }
+        if dirty != self.dirty_seen {
+            self.dirty_changed = now;
+            self.dirty_seen = dirty;
+        }
+        // Animate on to the end state: a pulse finishing, or a dot fading in/out.
+        if self.animations_on() {
+            let mut after: Option<f64> = None;
+            if let Some(start) = self.save_pulse {
+                let left = theme::PULSE_SECS - (now - start);
+                if left > 0.0 {
+                    after = Some(left);
+                } else {
+                    self.save_pulse = None;
+                }
+            }
+            if self.dirty_seen || self.dirty_dot_visible(now) {
+                let left = theme::DOT_FADE_SECS - (now - self.dirty_changed);
+                if left > 0.0 {
+                    after = Some(after.map_or(left, |a: f64| a.min(left)));
+                }
+            }
+            if let Some(left) = after.filter(|s| s.is_finite() && *s > 0.0) {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(left.min(1.0)));
+            }
+        }
+    }
+
+    /// Whether the dirty dot is still fading (its start or end) at `now`.
+    fn dirty_dot_visible(&self, now: f64) -> bool {
+        self.has_document() && now - self.dirty_changed < theme::DOT_FADE_SECS
+    }
+
+    /// The title bar's save pulse strength (0 at rest, 1 just after a save; animation effects off
+    /// draws the title at rest). [`theme::PULSE_SECS`].
+    pub(crate) fn save_pulse(&self, now: f64) -> f32 {
+        let Some(start) = self.save_pulse else { return 0.0 };
+        theme::pulse(now, start, theme::PULSE_SECS, self.animations_on())
+    }
+
+    /// How strongly the dirty dot shows: faded in after an edit, out after a save.
+    pub(crate) fn dirty_dot(&self, now: f64) -> f32 {
+        if !self.has_document() {
+            return 0.0;
+        }
+        theme::fade(now, self.dirty_changed, theme::DOT_FADE_SECS, self.animations_on(), self.dirty_seen)
+    }
+
     /// Lay out the window.
+    ///
+    /// Android feeds the system bars' insets through [`egui::RawInput::safe_area_insets`], which
+    /// [`egui::Context::content_rect`] removes; the ribbon, page and status bar are laid out there
+    /// so the gesture area never covers them. Desktop and web leave the insets at zero, so the
+    /// window is used whole and nothing moves.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let content = ctx.content_rect();
+        if content != ctx.viewport_rect() {
+            // Paint the strip under the system bars first: it is the window's own colour, not a
+            // hole left by the inset layout.
+            let t = theme::Tokens::get(&ctx);
+            ui.painter().rect_filled(ctx.viewport_rect(), 0.0, t.canvas);
+            let mut safe = ui.new_child(egui::UiBuilder::new().max_rect(content));
+            self.window_ui(&mut safe);
+        } else {
+            self.window_ui(ui);
+        }
+    }
+
+    /// The window's layout, inside the safe area ([`WordApp::ui`]).
+    fn window_ui(&mut self, ui: &mut egui::Ui) {
         let t0 = now_ms();
         let ctx = ui.ctx().clone();
+        self.note_save_feedback(&ctx);
         i18n::set_current(i18n::Lang::from_pref(&self.ui.language));
         // Animation effects off: egui's scroll areas get a wheel notch whole, not eased in.
         if !self.animations_on() {
@@ -2204,10 +2369,19 @@ impl WordApp {
             return;
         }
         let t = theme::Tokens::get(&ctx);
-        self.escape_free = self.dialog.is_none() && !self.ui.backstage && self.ui.keytips == keytips::Phase::Off && !egui::Popup::is_any_open(&ctx);
-        // Keytips are read before layout so the frame paints the new state; badges paint after
-        // the ribbon so they sit on top of it.
-        crate::keytips::logic(self, &ctx);
+        // The welcome tour is modal: Escape and the document's keys belong to it, not the page.
+        let touring = onboarding::visible(self);
+        self.escape_free =
+            !touring && self.dialog.is_none() && !self.ui.backstage && self.ui.keytips == keytips::Phase::Off && !egui::Popup::is_any_open(&ctx);
+        if touring {
+            // Nothing behind the tour takes keys or typing, even if the page had focus when it opened.
+            self.canvas.focused = false;
+            self.canvas.want_focus = false;
+        } else {
+            // Keytips are read before layout so the frame paints the new state; badges paint after
+            // the ribbon so they sit on top of it.
+            crate::keytips::logic(self, &ctx);
+        }
         // Focus (View › Immersive, the status bar) keeps only the title bar and the page; Escape
         // brings the rest back, as in Word.
         if self.session.view.focus_mode && self.dialog.is_none() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -2243,9 +2417,15 @@ impl WordApp {
         colors::show(self, &ctx);
         zotero::show_alert(self, &ctx);
         read_aloud::show(self, &ctx);
-        crate::keytips::show(self, &ctx, ui);
-        keys::global_shortcuts(self, &ctx);
-        self.refocus_after_chrome_click(&ctx);
+        if !touring {
+            crate::keytips::show(self, &ctx, ui);
+            keys::global_shortcuts(self, &ctx);
+        }
+        // The tour covers every other layer (dialogs included) and keeps clicks from reaching them.
+        onboarding::show(self, &ctx, ctx.content_rect());
+        if !touring {
+            self.refocus_after_chrome_click(&ctx);
+        }
         if let Some(url) = self.canvas.open_url.take() {
             ctx.open_url(egui::OpenUrl::new_tab(url));
         }
@@ -2619,6 +2799,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "readAloud.skipCitations"
             | "tools.customizeKeyboard"
             | "tools.customizeRibbon"
+            | "tools.autocorrect"
             | "view.darkMode"
             | "view.marks"
             | "view.ruler"
@@ -2642,6 +2823,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.discord"
             | "ui.caretAnimation"
             | "ui.startScreen"
+            | "ui.onboarding"
     ) || id.starts_with("help.")
 }
 
@@ -4836,6 +5018,222 @@ mod tests {
         }
         a.execute("file.close", json!({"force": true})).unwrap();
         assert!(!a.has_document() && !a.quit_requested);
+    }
+
+    /// Android Back never discards unsaved work: with nothing open it is the host's cue to close
+    /// the document/window, which asks first; with the Save Changes prompt up, Back is spent on
+    /// its Cancel, exactly as Escape is.
+    #[test]
+    fn android_back_never_discards_unsaved_work() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0));
+        let mut a = typed();
+        assert_eq!(a.back_gesture(&ctx), BackGesture::NothingOpen);
+        assert!(a.synthetic.is_empty(), "nothing was open, so nothing was sent");
+        assert!(!a.close_requested(), "closing a dirty document asks first");
+        assert_eq!(prompt(&a), Some("saveChanges"));
+
+        assert_eq!(a.back_gesture(&ctx), BackGesture::Dismissed, "the prompt is nearest");
+        assert_eq!(a.synthetic.len(), 2, "one Escape press and release, next frame");
+        // Run the queued Escape through real frames; the dialog answers its own Cancel.
+        let mut t = 0.0;
+        for _ in 0..6 {
+            t += 1.0 / 60.0;
+            let mut input = egui::RawInput { time: Some(t), screen_rect: Some(screen), ..Default::default() };
+            a.raw_input_hook(&mut input);
+            ctx.run_ui(input, |ui| {
+                a.logic(ui.ctx());
+                a.ui(ui);
+            })
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(prompt(&a), None, "Cancel closed the prompt");
+        assert!(a.has_document() && a.session.dirty, "the unsaved work is still there");
+        assert!(!a.quit_requested, "Back did not quit behind the prompt");
+    }
+
+    /// Android Back closes the File page, dialogs, drop-downs and keytips before it can mean
+    /// "close the document"; when nothing is open it leaves the decision to the host.
+    #[test]
+    fn android_back_closes_an_open_overlay_first() {
+        let ctx = egui::Context::default();
+        let mut a = typed();
+        a.ui.backstage = true;
+        assert_eq!(a.back_gesture(&ctx), BackGesture::Dismissed);
+        assert!(a.ui.backstage, "the Escape runs on the next frame, not mid-call");
+        assert!(matches!(a.synthetic.first(), Some(egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
+        a.synthetic.clear();
+        a.ui.backstage = false;
+        assert_eq!(a.back_gesture(&ctx), BackGesture::NothingOpen);
+        assert!(a.synthetic.is_empty());
+    }
+
+    /// Android Back on a first run leaves the welcome tour (as Skip does) instead of closing the
+    /// app behind it; the next Back is "nothing open", which asks to close through Save Changes.
+    #[test]
+    fn android_back_dismisses_the_welcome_tour_and_never_discards_work() {
+        let ctx = egui::Context::default();
+        let mut a = typed();
+        a.ui.onboarding_done = false;
+        assert!(onboarding::visible(&a), "a fresh profile starts on the tour");
+        assert_eq!(a.back_gesture(&ctx), BackGesture::Dismissed);
+        assert!(a.ui.onboarding_done, "Back finishes the tour like Skip");
+        assert!(a.synthetic.is_empty(), "no Escape was queued for the document");
+
+        assert_eq!(a.back_gesture(&ctx), BackGesture::NothingOpen, "the tour is no longer nearest");
+        assert!(!a.close_requested(), "closing the dirty document asks first");
+        assert_eq!(prompt(&a), Some("saveChanges"));
+        assert!(body_text(&a).contains(UNSAVED), "the unsaved work is still there");
+    }
+
+    /// The tour's completion flag round-trips through `ui.json`: a first run that wasn't finished
+    /// shows again, and a profile without the key (desktop, web, older versions) has seen it.
+    #[test]
+    fn the_welcome_tour_flag_is_saved_and_defaults_to_seen() {
+        let fresh = UiState::from_json(br#"{"theme":"dark"}"#).unwrap();
+        assert!(fresh.onboarding_done, "existing and desktop profiles don't see the tour");
+
+        let mut a = app();
+        a.ui.onboarding_done = false;
+        let bytes = serde_json::to_vec(&a.prefs()).unwrap();
+        assert!(!UiState::from_json(&bytes).unwrap().onboarding_done, "an unfinished first run shows the tour again");
+        a.ui.onboarding_done = true;
+        let bytes = serde_json::to_vec(&a.prefs()).unwrap();
+        assert!(UiState::from_json(&bytes).unwrap().onboarding_done, "Done and Skip are remembered");
+    }
+
+    /// The tour's command reads and writes the flag, reopens from Options at the first page, and
+    /// works with no document (File › Home), so a first run can always get back to it.
+    #[test]
+    fn the_welcome_tour_command_reopens_it_without_a_document() {
+        let mut a = app();
+        a.start_screen();
+        assert!(!a.has_document());
+        let v = a.run("ui.onboarding", json!({})).unwrap();
+        assert_eq!(v["onboarding"], true);
+        assert!(onboarding::visible(&a));
+        assert_eq!(a.onboarding.page, 0, "reopened at the welcome page");
+        assert!(a.run("ui.onboarding", json!({"value": false})).unwrap()["done"].as_bool().unwrap());
+        assert!(!onboarding::visible(&a));
+        assert!(a.run("ui.onboarding", json!({"value": 1})).is_err(), "only true or false");
+    }
+
+    /// The tour asks for Android's picker only with no document open; it never replaces one, so
+    /// unsaved work can't be lost from the Storage page.
+    #[test]
+    fn the_welcome_tour_never_replaces_an_open_document() {
+        let mut a = app();
+        // File › Home: no document is open yet, so the page may offer the picker.
+        a.start_screen();
+        assert!(!a.has_document());
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        a.services.open_async = Some(Box::new(move |purpose| seen.borrow_mut().push(purpose.to_string())));
+        assert!(onboarding::storage_action(&mut a));
+        assert_eq!(asked.borrow().first().map(String::as_str), Some("document"), "the same request File › Open makes");
+        // The document is open (the picker's result): the page reads as ready and never asks again.
+        a.no_document = None;
+        assert!(a.has_document());
+        asked.borrow_mut().clear();
+        assert!(onboarding::storage_action(&mut a));
+        assert!(asked.borrow().is_empty(), "no picker over an open document");
+    }
+
+    /// The welcome tour draws over the editor on a first run, moves between pages, and Skip takes
+    /// it away for good. Reopening from Options starts at the welcome page again.
+    #[test]
+    fn welcome_tour_pages_navigate_and_skip_finishes_it() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut a = app();
+        a.ui.onboarding_done = false;
+        let mut h = harness(a);
+        h.run_steps(8);
+        assert_eq!(h.state().onboarding.page, 0);
+        assert!(h.query_by_label("Welcome to WordCraft").is_some(), "the welcome page is up");
+        h.get_by_role_and_label(Role::Button, "Next").click();
+        h.run_steps(8);
+        assert_eq!(h.state().onboarding.page, 1, "Next moves on");
+        assert!(h.query_by_label("Your documents, through Android Files").is_some(), "the Storage page");
+        h.get_by_role_and_label(Role::Button, "Skip").click();
+        h.run_steps(6);
+        assert!(h.state().ui.onboarding_done, "Skip finishes the tour");
+        assert!(h.query_by_label("Welcome to WordCraft").is_none(), "and it is gone");
+
+        let mut a = h.into_state();
+        a.run("ui.onboarding", json!({"value": true})).unwrap();
+        assert!(onboarding::visible(&a) && a.onboarding.page == 0, "Options brings it back to the start");
+    }
+
+    /// The title bar's feedback follows saves: the dirty dot fades in on the first change and out
+    /// after a save, and the title pulses for a moment after one. With animation effects off both
+    /// show their end state at once and nothing pulses.
+    #[test]
+    fn title_dirty_dot_fades_and_the_save_pulse_runs_once() {
+        let ctx = egui::Context::default();
+        fn note(a: &mut WordApp, ctx: &egui::Context, t: f64) {
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+            let input = egui::RawInput { time: Some(t), screen_rect: Some(screen), ..Default::default() };
+            ctx.run_ui(input, |ui| a.note_save_feedback(ui.ctx())).drop_without_applying_deltas();
+        }
+        let mut a = app();
+        a.ui.animations = theme::Animations::On;
+        a.run("text.insert", json!({"text": UNSAVED})).unwrap();
+        note(&mut a, &ctx, 1.0);
+        assert!(a.dirty_dot(1.0) < 0.1, "the dot starts hidden");
+        assert!(a.dirty_dot(1.0 + theme::DOT_FADE_SECS) > 0.9, "and fades in after an edit");
+
+        a.session.dirty = false;
+        note(&mut a, &ctx, 2.0);
+        assert!(a.save_pulse(2.0) < 0.1, "the pulse starts at rest");
+        assert!(a.save_pulse(2.0 + theme::PULSE_SECS / 2.0) > 0.5, "and warms the title after a save");
+        assert!(a.save_pulse(2.0 + theme::PULSE_SECS) < 1e-6, "then settles");
+        assert!(a.dirty_dot(2.0 + theme::DOT_FADE_SECS) < 0.1, "the dot fades out");
+
+        a.ui.animations = theme::Animations::Off;
+        a.run("text.insert", json!({"text": "more"})).unwrap();
+        note(&mut a, &ctx, 3.0);
+        assert_eq!(a.dirty_dot(3.0), 1.0, "without animation the dot is simply on");
+        a.session.dirty = false;
+        note(&mut a, &ctx, 4.0);
+        assert_eq!(a.dirty_dot(4.0), 0.0, "and simply off");
+        assert_eq!(a.save_pulse(4.0), 0.0, "no pulse without animation");
+    }
+
+    /// Android's system-bar insets move the ribbon, page and status bar inside the safe area, and
+    /// an inset of zero (desktop and web) uses the whole window again.
+    #[test]
+    fn safe_area_insets_keep_the_page_clear_of_the_gesture_area() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 900.0));
+        let insets = egui::SafeAreaInsets(egui::epaint::MarginF32 { left: 10.0, right: 12.0, top: 30.0, bottom: 24.0 });
+        let mut a = typed();
+        let mut t = 0.0;
+        let mut frame = |a: &mut WordApp, insets: egui::SafeAreaInsets| {
+            t += 1.0 / 60.0;
+            ctx.run_ui(egui::RawInput { time: Some(t), screen_rect: Some(screen), safe_area_insets: Some(insets), ..Default::default() }, |ui| {
+                a.logic(ui.ctx());
+                a.ui(ui);
+            })
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..6 {
+            frame(&mut a, insets);
+        }
+        let content = ctx.content_rect();
+        assert_eq!(content.min, egui::pos2(10.0, 30.0));
+        assert_eq!(content.max, egui::pos2(1428.0, 876.0));
+        let canvas = a.canvas.canvas_rect.expect("the page area was laid out");
+        assert!(canvas.min.x >= content.min.x - 0.5 && canvas.min.y >= content.min.y - 0.5, "top/left clear: {canvas:?}");
+        assert!(canvas.max.x <= content.max.x + 0.5 && canvas.max.y <= content.max.y + 0.5, "bottom/right clear: {canvas:?}");
+        let inset_bottom = canvas.max.y;
+
+        for _ in 0..6 {
+            frame(&mut a, egui::SafeAreaInsets::default());
+        }
+        assert_eq!(ctx.content_rect().max.y, 900.0, "no insets means the whole window");
+        let canvas = a.canvas.canvas_rect.expect("the page area was laid out");
+        assert!(canvas.max.y > inset_bottom + 8.0, "with no insets the window is used whole again: {canvas:?}");
     }
 
     /// The window's close button quit at once; now it asks (the host cancels the close on false).

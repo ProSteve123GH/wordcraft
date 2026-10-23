@@ -396,6 +396,13 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
             };
             let font = TypeRung::Chrome.semibold();
             let track = TypeRung::Chrome.tracking();
+            // The dirty dot fades in with the first unsaved change and out after a save; the title
+            // briefly warms towards the accent just after a save or AutoSave. Both are at rest
+            // with animation effects off, so the title reads the same.
+            let now = ui.input(|i| i.time);
+            let dirty = app.dirty_dot(now);
+            let pulse = if app.has_document() { app.save_pulse(now) } else { 0.0 };
+            let title_color = if pulse > 0.0 { t.text.lerp_to_gamma(t.accent, pulse * 0.7) } else { t.text };
             let cx = full.center().x;
             let available = 2.0 * (cx - qat_end - 10.0).min(right_start - 10.0 - cx);
             let mut shown: String = title.chars().take(240).collect();
@@ -413,6 +420,10 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                 if response.clicked() {
                     let _ = app.run("file.rename", json!({}));
                 }
+                if dirty > 0.01 {
+                    // A small accent dot left of the name: the document has changes not yet saved.
+                    ui.painter().circle_filled(pos2(rect.min.x - 6.0, full.center().y), 3.2, t.accent.gamma_multiply(dirty));
+                }
 
                 paint_text(
                     ui.painter(),
@@ -421,7 +432,7 @@ pub fn title_bar(app: &mut WordApp, ui: &mut Ui) {
                     &shown,
                     &font,
                     track,
-                    t.text,
+                    title_color,
                 );
             }
         });

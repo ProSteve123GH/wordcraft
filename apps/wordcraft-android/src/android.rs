@@ -123,12 +123,37 @@ impl Drop for AndroidShell {
 impl eframe::App for AndroidShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_storage_results();
+        // Android Back: the keyboard goes first (it is the nearest thing), then the app's own
+        // Back gesture. With nothing open it asks to close; a dirty document goes through Save
+        // Changes, so unsaved work is never discarded here.
+        if BACK_REQUESTED.swap(false, Ordering::SeqCst) {
+            if IME_VISIBLE.swap(false, Ordering::SeqCst) {
+                self.app.canvas.ime_wanted = false;
+                self.ime.hide_soft_keyboard();
+            } else {
+                match self.app.back_gesture(ctx) {
+                    wordcraft_ui_egui::BackGesture::Dismissed => {}
+                    wordcraft_ui_egui::BackGesture::NothingOpen => {
+                        // Clean or no document: the activity finishes now. A dirty document opens
+                        // Save Changes instead (false), and the `quit_requested` pass below closes
+                        // once it is answered.
+                        if self.app.close_requested() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
         self.app.logic(ctx);
-        // Settings live in the app's private storage; write them a few seconds after a change and
-        // once more when the user quits. A failure is only logged.
+        // Settings live in the app's private storage; write them a few seconds after a change,
+        // when the activity pauses, and once more when the user quits. A failure is only logged.
+        if PAUSE_REQUESTED.swap(false, Ordering::SeqCst) {
+            self.prefs.save_now(&self.app);
+        }
         self.prefs.maybe_save(&self.app);
-        // Android's back gesture arrives as a viewport close request. `WordApp` asks before
-        // discarding unsaved work; once it decides to quit, let eframe finish the activity.
+        // `close_requested` asks before discarding unsaved work; once it decides to quit, let
+        // eframe finish the activity.
         if self.app.quit_requested {
             self.prefs.save_now(&self.app);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -136,6 +161,19 @@ impl eframe::App for AndroidShell {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Java reports the system bars and display cutout in device-independent pixels. egui's
+        // screen is in points after the interface zoom, so divide by it: the bars keep their
+        // physical size at every Interface size, and the ribbon, page and status bar stay clear
+        // of the cutout, the status bar and the navigation/gesture area.
+        let zoom = ctx.zoom_factor();
+        let zoom = if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 };
+        let [left, top, right, bottom] = *lock(safe_insets());
+        raw.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 {
+            left: (left / zoom).clamp(0.0, 4096.0),
+            right: (right / zoom).clamp(0.0, 4096.0),
+            top: (top / zoom).clamp(0.0, 4096.0),
+            bottom: (bottom / zoom).clamp(0.0, 4096.0),
+        }));
         self.app.raw_input_hook(raw);
         self.ime.poll(&mut raw.events);
         // A real page tap asks for the keyboard even when Android hid it with Back: egui's
@@ -189,7 +227,7 @@ impl ImeBridge {
     }
 
     fn hide_soft_keyboard(&self) {
-        // `false` hides it even when the IME considers itself implicitly shown.
+        // `false`: hide it even when an editor still nominally holds focus (Android Back).
         self.android.hide_soft_input(false);
     }
 
@@ -310,27 +348,31 @@ impl PrefsStore {
         Self { path, last: None, last_write: Instant::now() }
     }
 
-    /// Applies a stored `ui.json`; junk, missing and oversized files keep the defaults.
-    fn restore(&mut self, app: &mut WordApp) {
-        let Some(path) = self.path.as_ref() else { return };
+    /// Applies a stored `ui.json`; junk, missing and oversized files keep the defaults. Returns
+    /// whether a settings file exists at all: `false` is a first run (the welcome tour shows).
+    fn restore(&mut self, app: &mut WordApp) -> bool {
+        let Some(path) = self.path.as_ref() else { return false };
         let size = match std::fs::metadata(path) {
             Ok(meta) => meta.len(),
-            Err(_) => return,
+            // No file: a first run. Later read or parse problems still count as an existing
+            // profile (below), so a damaged `ui.json` never brings the tour back.
+            Err(_) => return false,
         };
         if size > MAX_PREFS_BYTES {
             log::warn!("ignoring {}: it is {} bytes", path.display(), size);
-            return;
+            return true;
         }
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(e) => {
                 log::warn!("cannot read {}: {e}", path.display());
-                return;
+                return true;
             }
         };
         if let Some(ui) = UiState::from_json(&bytes) {
             app.apply_prefs(ui);
         }
+        true
     }
 
     fn maybe_save(&mut self, app: &WordApp) {
@@ -469,6 +511,23 @@ fn repaint_ui() {
     }
 }
 
+/// The display's safe-area insets (system bars, cutout) in egui points, set by Java's window-insets
+/// listener. `RawInput::safe_area_insets` keeps the last value when it is `None`, so this is fed
+/// every frame; values are clamped so no display can make the content rect negative.
+fn safe_insets() -> &'static Mutex<[f32; 4]> {
+    static INSETS: Mutex<[f32; 4]> = Mutex::new([0.0; 4]);
+    &INSETS
+}
+
+/// Java's Back was pressed (the new `OnBackInvokedCallback` or `onBackPressed`), to be handled on
+/// the next UI pass where the document and dialogs live.
+static BACK_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The soft keyboard was visible in the last window insets. Back hides it first, as Android apps do.
+static IME_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// The activity is pausing: flush settings at the next pass. A destroyed activity also saves on
+/// drop, so a suspended loop loses nothing.
+static PAUSE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 /// The platform services: SAF pickers for opening, and writes through the current URI or a
 /// create-document picker.
 fn android_services(android: &AndroidApp, inbox: Inbox, saves: AsyncSaves) -> Services {
@@ -495,6 +554,8 @@ fn android_services(android: &AndroidApp, inbox: Inbox, saves: AsyncSaves) -> Se
         // Gboard covers half a tablet: put it away as soon as the user leaves the page or a text
         // field, so the ribbon, the File page and the document around it can be scrolled.
         dismiss_soft_keyboard_on_chrome: true,
+        // Fingers on a tablet: larger tap targets and spacing, and the taller ribbon strip.
+        touch: true,
         ..Default::default()
     }
 }
@@ -618,6 +679,56 @@ pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeSaveResul
         .resolve::<jni::errors::LogErrorAndDefault>();
 }
 
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeInsets<'local>(
+    _unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    left: jni::sys::jfloat,
+    top: jni::sys::jfloat,
+    right: jni::sys::jfloat,
+    bottom: jni::sys::jfloat,
+) {
+    let mut values = [left, top, right, bottom];
+    for v in &mut values {
+        *v = if v.is_finite() { v.clamp(0.0, 4096.0) } else { 0.0 };
+    }
+    *lock(safe_insets()) = values;
+    repaint_ui();
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeImeVisible<'local>(
+    _unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    visible: jni::sys::jboolean,
+) {
+    IME_VISIBLE.store(visible != 0, Ordering::SeqCst);
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeBack<'local>(_unowned_env: EnvUnowned<'local>, _class: JClass<'local>) {
+    BACK_REQUESTED.store(true, Ordering::SeqCst);
+    repaint_ui();
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativePause<'local>(_unowned_env: EnvUnowned<'local>, _class: JClass<'local>) {
+    PAUSE_REQUESTED.store(true, Ordering::SeqCst);
+    repaint_ui();
+}
+
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeResume<'local>(_unowned_env: EnvUnowned<'local>, _class: JClass<'local>) {
+    // Preferences stay live across a resume; asking for a frame picks up the bars and insets the
+    // system may have moved while the activity was away.
+    repaint_ui();
+}
+
 /// Native entry point called by GameActivity through `android-activity`.
 ///
 /// The export is the only `no_mangle` symbol in the Android crate; the enclosing module is the
@@ -654,7 +765,11 @@ pub fn android_main(app: AndroidApp) {
             let mut session = Session::new(wordcraft_engine::doc::Document::new());
             session.system_region = wordcraft_ui_egui::i18n::system_region();
             let mut app = WordApp::new(session, services);
-            prefs.restore(&mut app);
+            let returning = prefs.restore(&mut app);
+            // First launch: the one-time welcome tour (the host stores its completion in ui.json).
+            if !returning {
+                app.ui.onboarding_done = false;
+            }
             app.start_screen();
             // SAF save writes through `download`; AutoSave stays off until it can reuse the
             // current document URI safely on every path.
