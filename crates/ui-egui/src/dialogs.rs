@@ -415,6 +415,13 @@ pub enum Dialog {
         #[serde(default)]
         message: String,
     },
+    /// Android Back with nothing left to close: "Exit WordCraft?" An accidental back-swipe on the
+    /// page must not end the app over no warning at all, even when nothing is unsaved (`name` is
+    /// only there for the exit message). `ui.exitApp` answers it; with unsaved changes the Save
+    /// Changes prompt comes instead, and with no document the host simply finishes the activity.
+    Exit {
+        name: String,
+    },
     /// Mailings › Select Recipients / Edit Recipient List: a table of recipients to type or
     /// edit (field names on top), or a file to load instead (#240).
     RecipientList {
@@ -983,6 +990,7 @@ impl Dialog {
             Dialog::PasteSpecial { .. } => "pasteSpecial",
             Dialog::About { .. } => "about",
             Dialog::SaveChanges { .. } => "saveChanges",
+            Dialog::Exit { .. } => "exitApp",
             Dialog::DiscardRecovery { .. } => "discardRecovery",
             Dialog::RecipientList { .. } => "recipientList",
             Dialog::SelectTable { .. } => "selectTable",
@@ -1441,6 +1449,7 @@ pub fn show(app: &mut WordApp, ctx: &egui::Context) {
         Dialog::PasteSpecial { .. } => "Paste Special",
         Dialog::About { .. } => "About WordCraft",
         Dialog::SaveChanges { .. } => "WordCraft",
+        Dialog::Exit { .. } => "WordCraft",
         Dialog::DiscardRecovery { .. } => "Discard recovery copy",
         Dialog::RecipientList { .. } => "Recipient List",
         Dialog::SelectTable { .. } => "Select Table",
@@ -2774,6 +2783,42 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             // `ui.saveChanges` reads the prompt from `app.dialog`, which `show` has taken out.
             app.dialog = Some(d.clone());
             let _ = app.run("ui.saveChanges", json!({"answer": answer}));
+            true
+        }
+        Dialog::Exit { name } => {
+            ui.label(egui::RichText::new(tl!("Exit WordCraft?")).font(semibold(15.0)));
+            ui.label(crate::i18n::fmt(tl!("{name} has no unsaved changes. Cancel stays; Exit closes the app."), &[("name", name)]));
+            ui.add_space(8.0);
+            let buttons = ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let cancel = ui.button(tl!("Cancel"));
+                    let exit = ui.add(crate::widgets::primary_button(ui, tl!("Exit")));
+                    [(cancel, "cancel"), (exit, "exit")]
+                })
+                .inner
+            });
+            let buttons = buttons.inner;
+            // Exit has focus when the prompt opens, so Enter exits; Escape and Back mean Cancel.
+            // The focus is taken from whatever held it, as in the Save Changes prompt.
+            if !buttons.iter().any(|(b, _)| b.has_focus())
+                && let Some((exit, _)) = buttons.get(1)
+            {
+                exit.request_focus();
+            }
+            let focused = buttons.iter().any(|(b, _)| b.has_focus());
+            let answer = if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                Some("cancel")
+            } else if let Some((_, a)) = buttons.iter().find(|(b, _)| b.clicked()) {
+                Some(*a)
+            } else if !focused && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                Some("cancel")
+            } else {
+                None
+            };
+            let Some(answer) = answer else { return false };
+            // `ui.exitApp` reads the prompt from `app.dialog`, which `show` has taken out.
+            app.dialog = Some(d.clone());
+            let _ = app.run("ui.exitApp", json!({"answer": answer}));
             true
         }
         Dialog::RecipientList { fields, rows, message, filter } => recipient_list(app, ui, fields, rows, message, filter),

@@ -58,6 +58,7 @@ pub mod frame;
 pub mod guides;
 pub mod i18n;
 pub mod icons;
+pub mod ime_buffer;
 pub mod ink;
 pub mod keys;
 pub mod keytips;
@@ -1529,6 +1530,35 @@ impl WordApp {
         false
     }
 
+    /// Android Back with nothing left to close ([`BackGesture::NothingOpen`]): the page is never
+    /// one swipe from gone. A dirty document (or a save still unconfirmed, or a refused comment
+    /// draft) asks through Save Changes, exactly as [`Self::close_requested`] does; a *clean*
+    /// document still confirms with the Exit prompt — an accidental back-swipe must not end the
+    /// app over no warning at all — and with no document the host may finish at once. Returns
+    /// whether the host may close now; on Exit the answer (`ui.exitApp`) sets `quit_requested`,
+    /// which the host's next pass acts on.
+    pub fn back_close(&mut self) -> bool {
+        if self.printing.busy() {
+            self.status(tl!("Wait for the print job to finish submitting before closing."));
+            return false;
+        }
+        if self.quit_requested {
+            return true;
+        }
+        // Nothing open (the start page): Back is leaving the app for good, as it always did.
+        if !self.has_document() {
+            return true;
+        }
+        if self.session.dirty || self.save_unconfirmed() || panes::flush_comment_drafts(self).is_err() {
+            return self.close_requested();
+        }
+        if !matches!(self.dialog, Some(dialogs::Dialog::Exit { .. })) {
+            self.ui.backstage = false;
+            self.dialog = Some(dialogs::Dialog::Exit { name: self.prompt_name() });
+        }
+        false
+    }
+
     /// File › Close (Mod+W, Mod+F4) closes the document and keeps the window, as Word does
     /// (#1712): it shows no page, as after Esc on the Start screen (#1129), and File › New or Open
     /// goes on from there. `{"quit": true}`, from the window's close button, quits instead. With no
@@ -1875,6 +1905,18 @@ impl WordApp {
                     return Some(Err("`answer` must be save, dontSave or cancel".into()));
                 };
                 return Some(self.answer_save_changes(choice));
+            }
+            // The Exit prompt's answer (Android Back with nothing left to close): Exit sets
+            // `quit_requested`, which the host's next pass acts on; Cancel just closes the prompt.
+            "ui.exitApp" => {
+                return Some(match s("answer") {
+                    Some("exit") => {
+                        self.quit_requested = true;
+                        Ok(json!({"quit": true}))
+                    }
+                    Some("cancel") => Ok(json!({"quit": false})),
+                    _ => Err("`answer` must be exit or cancel".into()),
+                });
             }
             "ui.openFileDialog" => {
                 self.open_dialog();
@@ -3004,6 +3046,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.caretAnimation"
             | "ui.startScreen"
             | "ui.onboarding"
+            | "ui.exitApp"
     ) || id.starts_with("help.")
 }
 
@@ -5230,6 +5273,45 @@ mod tests {
         assert_eq!(prompt(&a), None, "Cancel closed the prompt");
         assert!(a.has_document() && a.session.dirty, "the unsaved work is still there");
         assert!(!a.quit_requested, "Back did not quit behind the prompt");
+    }
+
+    /// Android Back with a clean document still confirms the exit (the host's `back_close`, the
+    /// decision point behind `BackGesture::NothingOpen`): an accidental back-swipe on the page
+    /// must not end the app over no warning at all. Exit answers quit, Cancel answers stay.
+    #[test]
+    fn android_back_asks_to_exit_even_a_clean_document() {
+        let ctx = egui::Context::default();
+        let mut a = app();
+        assert!(!a.session.dirty && a.has_document(), "a fresh blank document, nothing unsaved");
+        assert_eq!(a.back_gesture(&ctx), BackGesture::NothingOpen);
+
+        assert!(!a.back_close(), "the Exit prompt is up; the host may not close yet");
+        assert_eq!(prompt(&a), Some("exitApp"));
+        assert!(!a.quit_requested);
+
+        // Cancel keeps everything, and the prompt is gone with its own answer.
+        a.run("ui.exitApp", json!({"answer": "cancel"})).unwrap();
+        assert_eq!(prompt(&a), None, "the answer closed the prompt");
+        assert!(!a.quit_requested && a.has_document());
+
+        // Exit quits, for the host's next pass to act on.
+        a.run("ui.exitApp", json!({"answer": "exit"})).unwrap();
+        assert!(a.quit_requested, "Exit was confirmed");
+    }
+
+    /// The dirty path through `back_close` opens Save Changes, not Exit — the unsaved work is
+    /// asked about first, exactly as `close_requested` does.
+    #[test]
+    fn android_back_with_a_dirty_document_asks_to_save_changes() {
+        let mut a = typed();
+        assert!(!a.back_close(), "Save Changes is up; the host may not close yet");
+        assert_eq!(prompt(&a), Some("saveChanges"), "not the Exit prompt");
+        assert!(!a.quit_requested, "answering happens later, on `ui.saveChanges`");
+        // And with no document at all, Back needs no prompting.
+        let mut empty = app();
+        empty.execute("file.new", json!({})).unwrap();
+        empty.no_document = Some(empty.session.document_id());
+        assert!(empty.back_close(), "nothing open: the host may finish at once");
     }
 
     /// Android Back closes the File page, dialogs, drop-downs and keytips before it can mean

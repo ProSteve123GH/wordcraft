@@ -1633,14 +1633,26 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let pointer_tap = pointer_click && resp.interact_pointer_pos().is_some();
     let accesskit_click = resp.clicked() && !pointer_click && !keyboard_click;
     let focus_click = pointer_click || accesskit_click || resp.drag_started();
-    // Android: only a real tap on the page asks for the soft keyboard. Space and Enter on a
-    // hardware keyboard also look like a click to egui, but must not open Gboard; a drag (a
-    // flick, a scroll or a selection) starts editing without it; and a ribbon click keeps the
-    // keyboard as it is (`WordApp::refocus_after_chrome_click`). The count lets the host show it
-    // again for each tap, even though `ime_wanted` only says it should be up.
-    if pointer_tap {
+    // Android: only a real tap **on the page** asks for the soft keyboard — the grey between and
+    // around the pages is a workspace, not text, and a keyboard over it only blocks the scroll
+    // and the zoom. A page tap also moves the caret: its bump tells the host to settle the IME
+    // buffer (typed characters are never dropped on a caret move) and to show Gboard once —
+    // always when it is down (the first tap), never again when it is already up, so reposition
+    // taps never pulse it. Space and Enter on a hardware keyboard also look like a click to egui,
+    // but must not open Gboard; a drag (a flick, a scroll or a selection) starts editing without
+    // it; and a ribbon click keeps the keyboard as it is (`WordApp::refocus_after_chrome_click`).
+    if pointer_tap && resp.interact_pointer_pos().is_some_and(|p| rects.iter().any(|r| r.contains(p))) {
         app.canvas.soft_keyboard_request = app.canvas.soft_keyboard_request.saturating_add(1);
-        app.canvas.ime_wanted = true;
+        if !app.canvas.ime_wanted {
+            // The keyboard is opening: bring the caret up into what will be visible above it, as
+            // Android apps do when typing (never in Reading mode: its taps are for pages).
+            app.canvas.ime_wanted = true;
+            if !app.session.view.read_mode {
+                app.canvas.scroll_to_caret = true;
+            }
+        }
+    } else if pointer_tap {
+        app.canvas.ime_wanted = false;
     }
     if focus_click || (app.canvas.want_focus && !resp.has_focus()) {
         resp.request_focus();

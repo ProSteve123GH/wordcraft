@@ -57,8 +57,11 @@ impl AndroidShell {
             }
         } else if wanted && tapped && text_field {
             // Back can dismiss Gboard while a text field keeps focus; tapping that field again
-            // should bring it back even though egui's IME request never stopped.
-            self.ime.show_soft_keyboard();
+            // should bring it back even though egui's IME request never stopped. When Android
+            // says it is already visible, the show stays down (no repop).
+            if !IME_VISIBLE.load(Ordering::SeqCst) {
+                self.ime.show_soft_keyboard();
+            }
         }
     }
 
@@ -152,10 +155,11 @@ impl eframe::App for AndroidShell {
                 match self.app.back_gesture(ctx) {
                     wordcraft_ui_egui::BackGesture::Dismissed => {}
                     wordcraft_ui_egui::BackGesture::NothingOpen => {
-                        // Clean or no document: the activity finishes now. A dirty document opens
-                        // Save Changes instead (false), and the `quit_requested` pass below closes
-                        // once it is answered.
-                        if self.app.close_requested() {
+                        // A dirty document opens Save Changes (false); a clean one the Exit
+                        // prompt, so a back-swipe on the page never ends the app unasked. With
+                        // neither (or once Exit is answered) the activity finishes, and the
+                        // `quit_requested` pass below closes.
+                        if self.app.back_close() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
@@ -194,20 +198,25 @@ impl eframe::App for AndroidShell {
         }));
         self.app.raw_input_hook(raw);
         self.ime.poll(&mut raw.events);
-        // A real page tap asks for the keyboard even when Android hid it with Back: egui's
-        // `o.ime` allowance does not change in that case, so `show_soft_input` is called
-        // explicitly. Scrolling and ribbon taps never bump the counter.
+        // A page tap asks for the keyboard even when Android hid it with Back (egui's `o.ime`
+        // allowance does not change in that case). It also moves the caret: whatever the IME had
+        // in flight lands in the document, and the buffer starts fresh there. When Gboard is
+        // already up — a caret reposition among edits — Android's show is skipped, so a tap never
+        // pulses the keyboard.
         let request = self.app.canvas.soft_keyboard_request;
         if request != self.last_soft_keyboard_request {
             self.last_soft_keyboard_request = request;
-            self.ime.show_soft_keyboard();
+            self.ime.settle(&mut raw.events);
+            if !IME_VISIBLE.load(Ordering::SeqCst) {
+                self.ime.show_soft_keyboard();
+            }
         }
         // The soft keyboard has no text field of its own in the document: the document canvas
-        // decides when Android should show it. Leaving the page for the ribbon drops a
-        // composition that Gboard has not committed rather than typing it later. A dialog's own
-        // text field is a different story: `text_edit_focused` says egui still wants the IME.
+        // decides when Android should show it. Leaving the page for the ribbon or Back settles
+        // the same way: a dialog's own text field is a different story, `text_edit_focused`
+        // says egui still wants the IME.
         if !self.app.canvas.ime_wanted && !ctx.text_edit_focused() {
-            self.ime.cancel_composition(&mut raw.events);
+            self.ime.settle(&mut raw.events);
         }
     }
 
@@ -217,25 +226,25 @@ impl eframe::App for AndroidShell {
         // and cleared by the UI when a chrome click or an overlay takes the page out of editing.
         self.sync_soft_keyboard(ui.ctx());
         // Show it in the same frame as a page tap instead of waiting for the next input pass.
+        // Not when Gboard is already up: a caret reposition must not pulse the keyboard.
         let request = self.app.canvas.soft_keyboard_request;
         if request != self.last_soft_keyboard_request {
             self.last_soft_keyboard_request = request;
-            self.ime.show_soft_keyboard();
+            if !IME_VISIBLE.load(Ordering::SeqCst) {
+                self.ime.show_soft_keyboard();
+            }
         }
     }
 }
 
-/// GameActivity's text-input state is a small IME buffer, not the document. Composition stays in
-/// the buffer and is shown as a preedit; when the IME ends composition (or commits plain text) the
-/// new text goes to the document through egui's normal IME events. The buffer is emptied after
-/// every commit so Gboard's next word starts from a clean slate.
+/// GameActivity's text-input state is a small IME buffer, not the document. The translation from
+/// buffer to document edits lives in [`wordcraft_ui_egui::ime_buffer`] (unit-tested there); this
+/// bridge feeds it GameTextInput's state and hands its updates to egui with the Android call the
+/// opening and closing of Gboard on either side.
 struct ImeBridge {
     android: AndroidApp,
-    /// The last state read from GameActivity, to notice changes: GameActivity exposes the current
-    /// state but not its "changed" flag through `AndroidApp`.
-    last_text: String,
-    last_compose: Option<(usize, usize)>,
-    preedit: String,
+    /// The IME buffer's state against the document: what was committed, and the live composition.
+    buffer: wordcraft_ui_egui::ime_buffer::ImeBuffer,
 }
 
 impl ImeBridge {
@@ -262,78 +271,47 @@ impl ImeBridge {
             ImeOptions::IME_FLAG_NO_FULLSCREEN,
         );
         android.set_text_input_state(TextInputState::default());
-        Self { android, last_text: String::new(), last_compose: None, preedit: String::new() }
+        Self { android, buffer: wordcraft_ui_egui::ime_buffer::ImeBuffer::new() }
     }
 
     fn reset_buffer(&self) {
         self.android.set_text_input_state(TextInputState::default());
     }
 
-    /// Turns changes in GameActivity's IME buffer into egui's preedit/commit events.
-    fn poll(&mut self, events: &mut Vec<egui::Event>) {
-        let state = self.android.text_input_state();
-        let compose = state.compose_region.map(|s| (s.start, s.end)).filter(|(start, end)| end > start);
-        if state.text == self.last_text && compose == self.last_compose {
-            return;
+    /// Turns one update into egui's preedit/commit events: the ghost clears first, then the
+    /// document deletes before the caret and commits (in that order, exactly like Android).
+    fn push(&self, update: wordcraft_ui_egui::ime_buffer::ImeUpdate, events: &mut Vec<egui::Event>) {
+        if let Some(preedit) = update.preedit {
+            events.push(egui::Event::Ime(egui::ImeEvent::Preedit { text: preedit, active_range_chars: None }));
         }
-        if compose.is_some() {
-            // IMEs compose in place: the buffer holds the composition text. Show it under the
-            // caret, with the document unchanged until the IME commits.
-            if state.text != self.preedit {
-                events.push(egui::Event::Ime(egui::ImeEvent::Preedit { text: state.text.clone(), active_range_chars: None }));
-                self.preedit.clone_from(&state.text);
+        if let Some((delete_chars, insert)) = update.edit {
+            if delete_chars > 0 {
+                events.push(egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars: delete_chars, after_chars: 0 }));
             }
-            self.last_text.clone_from(&state.text);
-            self.last_compose = compose;
-            return;
+            if !insert.is_empty() {
+                events.push(egui::Event::Ime(egui::ImeEvent::Commit(insert)));
+            }
         }
-        let previous = std::mem::take(&mut self.last_text);
-        let composing = !self.preedit.is_empty();
-        if composing {
-            // Composition ended: commit the result (or nothing, if the IME cancelled it).
-            if state.text.is_empty() {
-                events.push(egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }));
-            } else {
-                events.push(egui::Event::Ime(egui::ImeEvent::Commit(state.text.clone())));
-            }
-            self.preedit.clear();
-        } else if let Some(inserted) = state.text.strip_prefix(previous.as_str()) {
-            if !inserted.is_empty() {
-                events.push(egui::Event::Ime(egui::ImeEvent::Commit(inserted.to_string())));
-            }
-        } else if let Some(remaining) = previous.strip_prefix(state.text.as_str()) {
-            // The IME deleted from its buffer (Backspace in the suggestion strip).
-            let removed = remaining.chars().count();
-            if removed > 0 {
-                events.push(egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars: removed, after_chars: 0 }));
-            }
-        } else if !state.text.is_empty() {
-            // A replacement that starts differently (autocorrect of a committed word): erase the
-            // old buffer and type the new text. Both normally start from empty.
-            let removed = previous.chars().count();
-            if removed > 0 {
-                events.push(egui::Event::Ime(egui::ImeEvent::DeleteSurrounding { before_chars: removed, after_chars: 0 }));
-            }
-            events.push(egui::Event::Ime(egui::ImeEvent::Commit(state.text.clone())));
-        }
-        self.last_compose = None;
-        self.reset_buffer();
-        // The reset is ours, not an IME edit: don't read it back as a deletion next frame.
-        self.last_text.clear();
     }
 
-    /// Drops an unfinished composition when the page gives up the keyboard.
-    fn cancel_composition(&mut self, events: &mut Vec<egui::Event>) {
-        if self.preedit.is_empty() && self.last_text.is_empty() && self.last_compose.is_none() {
-            return;
-        }
-        if !self.preedit.is_empty() {
-            events.push(egui::Event::Ime(egui::ImeEvent::Preedit { text: String::new(), active_range_chars: None }));
-            self.preedit.clear();
-        }
-        // Keep the last text so a later poll sees no change; the IME buffer is emptied too.
-        self.last_text.clear();
-        self.last_compose = None;
+    /// Reads the IME buffer and translates any change for this frame. Polling every frame is what
+    /// keeps fast typing honest: one read carries every keystroke since the last, so nothing is
+    /// dropped behind the app's back.
+    fn poll(&mut self, events: &mut Vec<egui::Event>) {
+        let state = self.android.text_input_state();
+        let compose = state.compose_region.filter(|span| span.end > span.start).map(|span| (span.start, span.end));
+        let update = self.buffer.poll(&state.text, compose);
+        self.push(update, events);
+    }
+
+    /// The caret moved to a new place (a page tap, or the page gave up the keyboard): whatever
+    /// the IME has in flight lands in the document now — typed characters are never dropped on a
+    /// caret move — and the buffer starts fresh, so the next word types at its new caret.
+    fn settle(&mut self, events: &mut Vec<egui::Event>) {
+        let state = self.android.text_input_state();
+        let update = self.buffer.poll(&state.text, None);
+        self.push(update, events);
+        self.buffer.reset();
         self.reset_buffer();
     }
 }
