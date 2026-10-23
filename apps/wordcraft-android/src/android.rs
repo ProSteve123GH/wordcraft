@@ -30,12 +30,36 @@ struct AndroidShell {
     /// The last `Canvas::soft_keyboard_request` seen. A page tap bumps it, and only then does the
     /// host ask Android to show the keyboard again (after Back, or after it was dismissed).
     last_soft_keyboard_request: u64,
+    /// Whether egui asked for a text input in the last frame. The host shows the keyboard for a
+    /// text field or the page and hides it again as soon as neither is editing, so it never
+    /// covers the ribbon or the File page while the user scrolls.
+    ime_wanted: bool,
 }
 
 impl AndroidShell {
     fn new(app: WordApp, android: AndroidApp, inbox: Inbox, saves: AsyncSaves, prefs: PrefsStore) -> Self {
         let ime = ImeBridge::new(android);
-        Self { app, ime, inbox, saves, prefs, last_soft_keyboard_request: 0 }
+        Self { app, ime, inbox, saves, prefs, last_soft_keyboard_request: 0, ime_wanted: false }
+    }
+
+    /// Bring the soft keyboard in line with what egui asked for this frame. A page tap also bumps
+    /// `soft_keyboard_request` (handled by the caller) so Back can be undone by tapping the page.
+    fn sync_soft_keyboard(&mut self, ctx: &egui::Context) {
+        let wanted = ctx.output(|o| o.ime.is_some());
+        let tapped = ctx.input(|i| i.pointer.any_pressed());
+        let text_field = ctx.text_edit_focused();
+        if wanted != self.ime_wanted {
+            self.ime_wanted = wanted;
+            if wanted {
+                self.ime.show_soft_keyboard();
+            } else {
+                self.ime.hide_soft_keyboard();
+            }
+        } else if wanted && tapped && text_field {
+            // Back can dismiss Gboard while a text field keeps focus; tapping that field again
+            // should bring it back even though egui's IME request never stopped.
+            self.ime.show_soft_keyboard();
+        }
     }
 
     /// Moves bytes and save outcomes from the Java picker threads into the app's own queues.
@@ -111,7 +135,7 @@ impl eframe::App for AndroidShell {
         }
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         self.app.raw_input_hook(raw);
         self.ime.poll(&mut raw.events);
         // A real page tap asks for the keyboard even when Android hid it with Back: egui's
@@ -124,15 +148,19 @@ impl eframe::App for AndroidShell {
         }
         // The soft keyboard has no text field of its own in the document: the document canvas
         // decides when Android should show it. Leaving the page for the ribbon drops a
-        // composition that Gboard has not committed rather than typing it later.
-        if !self.app.canvas.ime_wanted {
+        // composition that Gboard has not committed rather than typing it later. A dialog's own
+        // text field is a different story: `text_edit_focused` says egui still wants the IME.
+        if !self.app.canvas.ime_wanted && !ctx.text_edit_focused() {
             self.ime.cancel_composition(&mut raw.events);
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
-        // Show it in the same frame as the tap instead of waiting for the next input pass.
+        // Follow egui's IME request: it is set by the page while it edits and by any text field,
+        // and cleared by the UI when a chrome click or an overlay takes the page out of editing.
+        self.sync_soft_keyboard(ui.ctx());
+        // Show it in the same frame as a page tap instead of waiting for the next input pass.
         let request = self.app.canvas.soft_keyboard_request;
         if request != self.last_soft_keyboard_request {
             self.last_soft_keyboard_request = request;
@@ -158,6 +186,11 @@ impl ImeBridge {
     fn show_soft_keyboard(&self) {
         // `false` asks for the keyboard now instead of only when Android considers it implicit.
         self.android.show_soft_input(false);
+    }
+
+    fn hide_soft_keyboard(&self) {
+        // `false` hides it even when the IME considers itself implicitly shown.
+        self.android.hide_soft_input(false);
     }
 
     fn new(android: AndroidApp) -> Self {
@@ -459,6 +492,9 @@ fn android_services(android: &AndroidApp, inbox: Inbox, saves: AsyncSaves) -> Se
             Ok(())
         })),
         async_saves: Some(saves),
+        // Gboard covers half a tablet: put it away as soon as the user leaves the page or a text
+        // field, so the ribbon, the File page and the document around it can be scrolled.
+        dismiss_soft_keyboard_on_chrome: true,
         ..Default::default()
     }
 }

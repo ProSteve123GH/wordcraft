@@ -128,6 +128,11 @@ pub struct Services {
     /// Web: told whether the document has unsaved changes after each pass, for the browser's
     /// leave-page guard (`beforeunload` runs between frames and can't ask the app).
     pub on_dirty: Option<Box<dyn Fn(bool)>>,
+    /// Android: clicking the ribbon, the status bar, a dialog or the File page puts the soft
+    /// keyboard away, so it covers only the writing surface while the user edits. Only a text
+    /// field keeps it (egui's own `TextEdit`) and only a tap on the page asks for it again.
+    /// Desktop and web leave this off: their IME composition keeps working through chrome clicks.
+    pub dismiss_soft_keyboard_on_chrome: bool,
     /// Web: hand PDF bytes to the browser's print dialog (no download or intermediate file).
     /// Desktop uses `print_native` instead. An error means nothing was opened.
     pub print: Option<Box<dyn Fn(&[u8]) -> Result<(), String>>>,
@@ -2288,23 +2293,38 @@ impl WordApp {
     /// (font size, zoom, command search) keeps the focus it took, and clicks on a dialog, menu or
     /// popup, or while one is open, leave focus alone. Clicks on the page are the canvas's own.
     ///
-    /// It only restores focus: the selection and its typed formatting stay as they were. It also
-    /// never closes the soft keyboard, so tapping Bold, the font box or another ribbon tab keeps
-    /// typing (and the keyboard) where it was on Android.
+    /// It only restores focus: the selection and its typed formatting stay as they were. On a
+    /// host where [`Services::dismiss_soft_keyboard_on_chrome`] is set (Android), a click outside
+    /// the page also puts the soft keyboard away: it must cover only the writing surface. A text
+    /// field keeps it (egui's `TextEdit`), and only a later tap on the page asks for it again.
     fn refocus_after_chrome_click(&mut self, ctx: &egui::Context) {
+        // A text field owns the keyboard; everything else below is chrome or an overlay.
+        let dismiss = self.services.dismiss_soft_keyboard_on_chrome && !ctx.text_edit_focused();
         if self.ui.backstage || self.dialog.is_some() || self.colors.is_some() {
+            if dismiss {
+                self.canvas.ime_wanted = false;
+            }
             return;
         }
         #[cfg(not(target_arch = "wasm32"))]
         if self.file_browser.open.is_some() {
+            if dismiss {
+                self.canvas.ime_wanted = false;
+            }
             return;
         }
         let Some(pos) = ctx.input(|i| if i.pointer.any_click() { i.pointer.interact_pos() } else { None }) else { return };
-        // The page handles its own clicks (comment balloons there take the keyboard themselves).
-        if self.canvas.balloon.is_some() || self.canvas.viewport.is_some_and(|v| v.contains(pos)) {
+        // A click on the page (or its comment balloons) is the canvas's own business.
+        if self.canvas.viewport.is_some_and(|v| v.contains(pos)) {
             return;
         }
         let on_chrome = ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background);
+        if on_chrome && dismiss {
+            self.canvas.ime_wanted = false;
+        }
+        if self.canvas.balloon.is_some() {
+            return;
+        }
         if on_chrome && ctx.memory(|m| m.focused().is_none()) && !egui::Popup::is_any_open(ctx) {
             self.canvas.want_focus = true;
             // The page has already been drawn, so it only sees `want_focus` next frame, and its own
@@ -5505,13 +5525,15 @@ mod tests {
         assert!(h.state().canvas.ime_wanted, "a page tap opens the keyboard");
     }
 
-    /// Android: tapping a formatting control keeps the soft keyboard up, does not move the caret,
-    /// and leaves the formatting that typing will use active.
+    /// Android: tapping a formatting control puts the soft keyboard away (it belongs to the
+    /// page and text fields, not the ribbon), does not move the caret, and leaves the formatting
+    /// that typing will use active for a hardware keyboard.
     #[test]
-    fn formatting_clicks_keep_the_soft_keyboard_and_the_caret() {
+    fn formatting_clicks_put_the_soft_keyboard_away_and_keep_the_caret() {
         use egui::accesskit::Role;
 
         let mut a = typed();
+        a.services.dismiss_soft_keyboard_on_chrome = true;
         a.canvas.ime_wanted = true; // the page was tapped: Gboard is up
         let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
             |ui, app: &mut WordApp| {
@@ -5535,8 +5557,8 @@ mod tests {
 
         assert_eq!(h.state().session.sel, caret, "the caret stays where it was");
         assert!(h.state().canvas.focused, "the page keeps keyboard focus");
-        assert!(h.state().canvas.ime_wanted, "a formatting click keeps the keyboard up");
-        assert_eq!(h.state().canvas.soft_keyboard_request, request, "the ribbon is not the page");
+        assert!(!h.state().canvas.ime_wanted, "a formatting click puts the soft keyboard away");
+        assert_eq!(h.state().canvas.soft_keyboard_request, request, "the ribbon does not re-request it");
         let pending = h.state().session.pending.as_ref().expect("Bold arms the typing formatting");
         assert_eq!(pending.bold, Some(true), "Bold is armed for what is typed next");
 
@@ -5545,6 +5567,46 @@ mod tests {
         let para = h.state().session.doc.para_at(&caret.focus).expect("the caret's paragraph");
         assert_eq!(para.props_of_char(caret.focus.off).bold, Some(true), "the typed text is bold");
         assert!(body_text(h.state()).ends_with(" bold"), "the text reached the page");
+    }
+
+    /// Android: the File page and dialogs are outside the writing surface, so opening one puts
+    /// the soft keyboard away instead of leaving it over the pane the user is trying to scroll.
+    #[test]
+    fn android_overlays_put_the_soft_keyboard_away() {
+        let mut a = typed();
+        a.services.dismiss_soft_keyboard_on_chrome = true;
+        a.canvas.ime_wanted = true; // Gboard is up while the page is being edited
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).with_step_dt(1.0 / 60.0).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            a,
+        );
+        for _ in 0..6 {
+            h.step();
+        }
+        assert!(h.state().canvas.ime_wanted, "editing keeps the keyboard");
+
+        h.state_mut().run("ui.backstage", json!({"value": true})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        assert!(h.state().ui.backstage, "the File page is open");
+        assert!(!h.state().canvas.ime_wanted, "the File page puts the soft keyboard away");
+
+        h.state_mut().run("ui.backstage", json!({"value": false})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        assert!(!h.state().ui.backstage && !h.state().canvas.ime_wanted, "it stays down until the page is tapped");
+
+        h.state_mut().run("edit.advancedFind", json!({})).unwrap();
+        for _ in 0..4 {
+            h.step();
+        }
+        assert!(!h.state().canvas.ime_wanted, "a dialog takes the keyboard from the page");
     }
 
     /// Types `text` after a click on `what` and checks it reached the document (#1093).
