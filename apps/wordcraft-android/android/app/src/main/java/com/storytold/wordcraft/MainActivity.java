@@ -1,13 +1,17 @@
 package com.storytold.wordcraft;
 
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Process;
 import android.provider.OpenableColumns;
 import android.util.Log;
 import android.view.View;
+import android.widget.Toast;
 
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
@@ -51,6 +55,11 @@ public final class MainActivity extends GameActivity {
     /** Longest display name handed to the engine. */
     private static final int MAX_NAME_CHARS = 255;
 
+    /** Private storage for the document last opened or saved, so it survives process death. */
+    private static final String PREFS_DOCUMENT = "wordcraft.document";
+    private static final String KEY_DOCUMENT_URI = "document.uri";
+    private static final String KEY_DOCUMENT_NAME = "document.name";
+
     /**
      * The document last opened or saved. Save writes here without asking again; Save As and
      * exports always use the picker. Only touched on the Java main thread and the short-lived
@@ -83,6 +92,7 @@ public final class MainActivity extends GameActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Log.i(TAG, "onCreate " + this + " task=" + getTaskId());
+        restoreCurrentDocument();
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         hideSystemBars();
     }
@@ -178,10 +188,19 @@ public final class MainActivity extends GameActivity {
 
         String currentUri = currentDocumentUri;
         if (setCurrent && !forcePicker && currentUri != null && !currentUri.isEmpty()) {
-            String currentName = currentDocumentName;
-            writeTo(Uri.parse(currentUri), bytes, sanitizeName(currentName == null ? safeName : currentName),
-                    setCurrent, ticket);
-            return;
+            Uri uri = parseDocumentUri(currentUri);
+            if (uri != null && canWrite(uri)) {
+                String currentName = currentDocumentName;
+                writeTo(uri, bytes, sanitizeName(currentName == null ? safeName : currentName),
+                        setCurrent, ticket);
+                return;
+            }
+            // A permission can be revoked, or the provider can remove the file, while the app is
+            // gone. Forget it and fall back to the save picker instead of failing silently.
+            Log.w(TAG, "the current document is no longer writable; asking where to save");
+            forgetCurrentDocument();
+            Toast.makeText(this, "The document's file is no longer available. Choose where to save.",
+                    Toast.LENGTH_LONG).show();
         }
 
         if (pendingSave != null) {
@@ -203,6 +222,44 @@ public final class MainActivity extends GameActivity {
             pendingSave = null;
             Log.e(TAG, "cannot open the save picker", e);
             nativeSaveResult(ticket, false, false, safeName, "", message(e));
+        }
+    }
+
+    /**
+     * Reopens a document the user picked in File › Home's Recent list. The URI is the one stored
+     * in the app's private preferences; its persistable permission was taken when the document
+     * was first opened or saved. A revoked permission is reported to the native side, which shows
+     * the error instead of crashing.
+     */
+    public void startOpenUri(String uriText) {
+        openPurpose = "document";
+        Uri uri = parseDocumentUri(uriText);
+        if (uri == null) {
+            nativeOpenResult(new byte[0], "", "", "the recent document's location is no longer valid");
+            return;
+        }
+        if (!canRead(uri)) {
+            nativeOpenResult(new byte[0], "", uri.toString(),
+                    "access to this document has expired; open it again with Open");
+            return;
+        }
+        // Best effort: a provider that still has a live grant can persist it again.
+        takePersistablePermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        new Thread(() -> readOpenUri(uri, true), "wordcraft-open").start();
+    }
+
+    /** A new document replaced the old one: Save must ask where to write from now on. */
+    public void forgetCurrentDocument() {
+        currentDocumentUri = null;
+        currentDocumentName = null;
+        try {
+            getSharedPreferences(PREFS_DOCUMENT, MODE_PRIVATE).edit()
+                    .remove(KEY_DOCUMENT_URI)
+                    .remove(KEY_DOCUMENT_NAME)
+                    .apply();
+        } catch (Exception e) {
+            Log.w(TAG, "cannot forget the current document", e);
         }
     }
 
@@ -249,23 +306,27 @@ public final class MainActivity extends GameActivity {
 
         new Thread(() -> {
             for (Uri uri : uris) {
-                String name = displayName(uri);
-                try (InputStream in = getContentResolver().openInputStream(uri)) {
-                    if (in == null) {
-                        throw new IOException("the provider returned no stream");
-                    }
-                    byte[] bytes = readAll(in);
-                    if (document) {
-                        currentDocumentUri = uri.toString();
-                        currentDocumentName = name;
-                    }
-                    nativeOpenResult(bytes, name, uri.toString(), "");
-                } catch (Exception e) {
-                    Log.e(TAG, "cannot read " + uri, e);
-                    nativeOpenResult(new byte[0], name, uri.toString(), message(e));
-                }
+                readOpenUri(uri, document);
             }
         }, "wordcraft-open").start();
+    }
+
+    /** Reads one picked or recent URI on a worker thread and reports it to the native side. */
+    private void readOpenUri(Uri uri, boolean document) {
+        String name = displayName(uri);
+        try (InputStream in = getContentResolver().openInputStream(uri)) {
+            if (in == null) {
+                throw new IOException("the provider returned no stream");
+            }
+            byte[] bytes = readAll(in);
+            if (document) {
+                setCurrentDocument(uri, name);
+            }
+            nativeOpenResult(bytes, name, uri.toString(), "");
+        } catch (Exception e) {
+            Log.e(TAG, "cannot read " + uri, e);
+            nativeOpenResult(new byte[0], name, uri.toString(), message(e));
+        }
     }
 
     private void handleSaveResult(int resultCode, Intent data) {
@@ -299,6 +360,97 @@ public final class MainActivity extends GameActivity {
         }
     }
 
+    /** The document last opened or saved, read back after process death. Junk is forgotten. */
+    private void restoreCurrentDocument() {
+        try {
+            SharedPreferences prefs = getSharedPreferences(PREFS_DOCUMENT, MODE_PRIVATE);
+            String uri = prefs.getString(KEY_DOCUMENT_URI, "");
+            String name = prefs.getString(KEY_DOCUMENT_NAME, "");
+            if (uri == null || uri.isEmpty()) {
+                return;
+            }
+            if (parseDocumentUri(uri) == null) {
+                Log.w(TAG, "forgetting the saved document: its location is not supported");
+                forgetCurrentDocument();
+                return;
+            }
+            currentDocumentUri = uri;
+            currentDocumentName = sanitizeName(name);
+            Log.i(TAG, "restored the current document " + currentDocumentName);
+        } catch (Exception e) {
+            Log.w(TAG, "cannot restore the current document", e);
+        }
+    }
+
+    /** Record the document Save writes without asking again, in memory and private storage. */
+    private void setCurrentDocument(Uri uri, String name) {
+        if (uri == null) {
+            return;
+        }
+        String text = uri.toString();
+        if (text.isEmpty()) {
+            return;
+        }
+        String safeName = sanitizeName(name);
+        currentDocumentUri = text;
+        currentDocumentName = safeName;
+        try {
+            getSharedPreferences(PREFS_DOCUMENT, MODE_PRIVATE).edit()
+                    .putString(KEY_DOCUMENT_URI, text)
+                    .putString(KEY_DOCUMENT_NAME, safeName)
+                    .apply();
+        } catch (Exception e) {
+            // The document still saves for this run; only the relaunch record is lost.
+            Log.w(TAG, "cannot remember the current document", e);
+        }
+    }
+
+    /** A content: or file: URI, or null for anything else (never throws). */
+    private static Uri parseDocumentUri(String text) {
+        if (text == null || text.isEmpty()) {
+            return null;
+        }
+        try {
+            Uri uri = Uri.parse(text);
+            String scheme = uri.getScheme();
+            if ("content".equals(scheme) || "file".equals(scheme)) {
+                return uri;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "cannot parse a document location", e);
+        }
+        return null;
+    }
+
+    private boolean canRead(Uri uri) {
+        return canUse(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+    }
+
+    private boolean canWrite(Uri uri) {
+        return canUse(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+    }
+
+    /**
+     * Whether this app currently holds {@code mode} for {@code uri}. A failed check says yes and
+     * lets the read or write report the real problem; a plain file URI is handled by the stream.
+     */
+    private boolean canUse(Uri uri, int mode) {
+        String scheme = uri.getScheme();
+        if ("file".equals(scheme)) {
+            return true;
+        }
+        if (!"content".equals(scheme)) {
+            return false;
+        }
+        try {
+            return checkUriPermission(uri, Process.myPid(), Process.myUid(), mode)
+                    == PackageManager.PERMISSION_GRANTED;
+        } catch (Exception e) {
+            Log.w(TAG, "cannot check access to " + uri, e);
+            return true;
+        }
+    }
+
     private void writeTo(Uri uri, byte[] data, String name, boolean setCurrent, long ticket) {
         new Thread(() -> {
             boolean ok = false;
@@ -315,8 +467,7 @@ public final class MainActivity extends GameActivity {
                 error = message(e);
             }
             if (ok && setCurrent) {
-                currentDocumentUri = uri.toString();
-                currentDocumentName = name;
+                setCurrentDocument(uri, name);
             }
             nativeSaveResult(ticket, ok, false, name, uri.toString(), error);
         }, "wordcraft-save").start();

@@ -86,6 +86,8 @@ pub mod window_geometry;
 pub mod wordart_menus;
 pub mod zotero;
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wordcraft_engine::Session;
@@ -125,6 +127,19 @@ pub struct Services {
     /// #1315). The hook starts a ticket for such a save and reports how it ended; until then the
     /// document's save isn't confirmed, and a New/Open held back by the Save Changes prompt waits.
     pub async_saves: Option<async_saves::AsyncSaves>,
+    /// Android SAF: `download` writes through the document's current URI, so AutoSave can keep
+    /// that file up to date like a desktop path once the user has saved it here. The web leaves
+    /// this off: a download is a copy, not the document's file ([`AutoSaveBlock::Browser`]).
+    pub autosave_through_download: bool,
+    /// Android SAF: open a document by the location stored for a File › Home Recent entry. The
+    /// host reads it like a picker and returns the bytes through `inbox`; an error says why the
+    /// entry can't be opened (a revoked permission, a file that moved). `None` (desktop, web)
+    /// keeps the normal `file.open` path behaviour.
+    pub open_uri: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
+    /// Android SAF: the document was replaced by a new one (New, Close), so forget the host's
+    /// current document location. A later Save then asks where instead of overwriting the file
+    /// the previous document was using. `None` (desktop, web) changes nothing.
+    pub forget_document: Option<Box<dyn Fn()>>,
     /// Web: told whether the document has unsaved changes after each pass, for the browser's
     /// leave-page guard (`beforeunload` runs between frames and can't ask the app).
     pub on_dirty: Option<Box<dyn Fn(bool)>>,
@@ -243,6 +258,11 @@ pub struct UiState {
     /// Ribbon › Quick Access Toolbar) brings it back. Kept between runs.
     pub quick_access_toolbar: bool,
     pub recent: Vec<String>,
+    /// Where each recent document lives when it is not a filesystem path: Android stores the SAF
+    /// URI alongside the display name in `recent`, so File › Home can reopen it after a relaunch.
+    /// Desktop and web leave this empty; the key is the entry in `recent`.
+    #[serde(default, deserialize_with = "lenient_recent_uris", skip_serializing_if = "BTreeMap::is_empty")]
+    pub recent_uris: BTreeMap<String, String>,
     /// Symbols inserted from the Symbol dialog, most recent first (#321).
     pub recent_symbols: Vec<dialogs_insert::RecentSymbol>,
     /// Colours picked in the Colors dialog (More Colors…), most recent first (#606).
@@ -352,6 +372,39 @@ pub const MAX_DICTIONARY: usize = 10_000;
 pub const MAX_RECENT_FONTS: usize = 10;
 /// The longest family name Recently Used Fonts keeps, the longest `format.font` accepts.
 pub const MAX_FONT_NAME_BYTES: usize = 128;
+/// The longest location kept for a Recent document (a SAF URI can be long, but not unbounded).
+pub const MAX_RECENT_URI_BYTES: usize = 8 * 1024;
+/// The longest Recent key that can own a stored location (a display name or a path).
+const MAX_RECENT_KEY_BYTES: usize = 4 * 1024;
+
+/// A Recent document's location that is safe to keep in `ui.json`: a bounded, control-free
+/// `content:` or `file:` URI. Anything else is dropped rather than trusted later.
+pub fn clean_recent_uri(uri: &str) -> Option<String> {
+    let uri = uri.trim();
+    if uri.is_empty() || uri.len() > MAX_RECENT_URI_BYTES || uri.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let scheme = uri.split_once(':')?.0.to_ascii_lowercase();
+    matches!(scheme.as_str(), "content" | "file").then(|| uri.to_string())
+}
+
+/// `recentUris` as saved: only well-formed locations with a bounded key are kept. A junk entry
+/// drops itself, not the whole map.
+fn lenient_recent_uris<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+    let v = Value::deserialize(d)?;
+    let mut out = BTreeMap::new();
+    if let Some(map) = v.as_object() {
+        for (key, value) in map {
+            if key.is_empty() || key.len() > MAX_RECENT_KEY_BYTES {
+                continue;
+            }
+            if let Some(uri) = value.as_str().and_then(clean_recent_uri) {
+                out.insert(key.clone(), uri);
+            }
+        }
+    }
+    Ok(out)
+}
 
 impl Default for UiState {
     fn default() -> Self {
@@ -363,6 +416,7 @@ impl Default for UiState {
             ribbon_collapsed: false,
             quick_access_toolbar: true,
             recent: Vec::new(),
+            recent_uris: BTreeMap::new(),
             recent_symbols: Vec::new(),
             recent_colors: Vec::new(),
             recent_fonts: Vec::new(),
@@ -420,6 +474,22 @@ impl UiState {
     /// How many recent documents to list.
     pub fn recent_shown(&self) -> usize {
         self.recent_count.min(MAX_RECENT)
+    }
+
+    /// Remember where a Recent document lives (Android: its SAF URI). The key is the entry in
+    /// [`Self::recent`]; junk keys or locations are ignored.
+    pub fn remember_recent_uri(&mut self, key: &str, uri: &str) {
+        if key.is_empty() || key.len() > MAX_RECENT_KEY_BYTES {
+            return;
+        }
+        if let Some(uri) = clean_recent_uri(uri) {
+            self.recent_uris.insert(key.to_string(), uri);
+        }
+    }
+
+    /// Where a Recent document lives, when it is not a filesystem path.
+    pub fn recent_uri(&self, key: &str) -> Option<&str> {
+        self.recent_uris.get(key).map(String::as_str)
     }
 }
 
@@ -772,6 +842,9 @@ impl WordApp {
     pub fn apply_prefs(&mut self, ui: UiState) {
         self.ui = ui;
         self.ui.backstage = false;
+        // A location is only useful for an entry that is still listed (and still well formed).
+        let recent = self.ui.recent.clone();
+        self.ui.recent_uris.retain(|key, uri| recent.contains(key) && clean_recent_uri(uri).is_some());
         // Word opens on Home every launch, so the tab `ui.json` holds is not restored. Going File
         // and back to the editor within the run still returns to the tab that was showing.
         self.ui.tab = DEFAULT_TAB.into();
@@ -989,6 +1062,12 @@ impl WordApp {
             if marked_saved {
                 self.session.dirty = false;
             }
+            // Android: the save went to the document's current SAF URI, so AutoSave may keep
+            // writing that file. With an asynchronous host, only a confirmed write counts
+            // (settle_async_saves); a cancelled picker must not turn AutoSave on.
+            if marked_saved && self.services.autosave_through_download && saves.is_none() {
+                self.autosave_path = self.session.path.clone();
+            }
             // The browser's picker writes the file later (#1315): until it says how that went,
             // the document's save isn't confirmed.
             if let Some(ticket) = saves.as_ref().and_then(async_saves::AsyncSaves::take_started) {
@@ -1001,6 +1080,14 @@ impl WordApp {
         let document = self.session.document_id();
         let old_path = self.session.path.clone();
         let r = self.session.run(id, &params).map_err(|e| e.to_string());
+        // A brand-new document has no file: the host must forget the previous document's
+        // location, or its next Save would overwrite that file instead of asking where to go.
+        if r.is_ok()
+            && id == "file.new"
+            && let Some(forget) = &self.services.forget_document
+        {
+            forget();
+        }
         // Copy and Cut put what they took on the system clipboard, whichever control ran them
         // (the ribbon, a context menu, the native menu, or the Cmd+C/X event). Only the key event
         // used to write it, so a Cut button deleted the words without copying them.
@@ -1038,6 +1125,7 @@ impl WordApp {
             }
             let old = old.to_string_lossy();
             self.ui.recent.retain(|r| *r != old);
+            self.ui.recent_uris.remove(old.as_ref());
         }
         if let Ok(v) = &r {
             self.keep_web_font(id, &params, v);
@@ -1232,7 +1320,15 @@ impl WordApp {
             if let Some(i) = self.saves_in_flight.iter().position(|s| s.ticket == ticket) {
                 let save = self.saves_in_flight.swap_remove(i);
                 match &outcome {
-                    async_saves::SaveOutcome::Saved => log::info!("saved {} through the save picker", save.name),
+                    async_saves::SaveOutcome::Saved => {
+                        log::info!("saved {} through the save picker", save.name);
+                        // Android: the host's current document location now holds this file, so
+                        // AutoSave may keep it up to date from here. (The host sets the display
+                        // name as the session path before this runs.)
+                        if self.services.autosave_through_download && save.marked_saved && save.document == current {
+                            self.autosave_path = self.session.path.clone();
+                        }
+                    }
                     async_saves::SaveOutcome::Cancelled | async_saves::SaveOutcome::Failed(_) => {
                         if save.marked_saved && save.document == current {
                             self.session.dirty = true;
@@ -1335,6 +1431,21 @@ impl WordApp {
         Ok(json!({"closed": true}))
     }
 
+    /// Put `key` first in File › Home's Recent list, once (a file path on desktop, a display name
+    /// on Android). Locations for entries that fell off the list are dropped too.
+    pub fn note_recent(&mut self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        if self.ui.recent.first().map(String::as_str) != Some(key) {
+            self.ui.recent.retain(|r| r != key);
+            self.ui.recent.insert(0, key.to_string());
+            self.ui.recent.truncate(MAX_RECENT);
+        }
+        let recent = self.ui.recent.clone();
+        self.ui.recent_uris.retain(|k, _| recent.contains(k));
+    }
+
     fn after_command(&mut self, id: &str) {
         options::sync(self);
         self.canvas.caret_visible_since = now_ms();
@@ -1357,12 +1468,8 @@ impl WordApp {
         for req in std::mem::take(&mut self.session.ui_requests) {
             self.handle_request(&req);
         }
-        if let Some(p) = self.session.path.as_ref().map(|p| p.to_string_lossy().to_string())
-            && self.ui.recent.first() != Some(&p)
-        {
-            self.ui.recent.retain(|r| *r != p);
-            self.ui.recent.insert(0, p);
-            self.ui.recent.truncate(MAX_RECENT);
+        if let Some(p) = self.session.path.as_ref().map(|p| p.to_string_lossy().to_string()) {
+            self.note_recent(&p);
         }
         if !self.session.status.is_empty() {
             // Engine messages are English; the catalog translates the ones it knows.
@@ -2106,9 +2213,11 @@ impl WordApp {
 
     /// Why AutoSave can't cover the document, or `None` when it can: it writes only a file the
     /// user saved to in this session, in a format that keeps everything, and never in the browser
-    /// (a page can't write to the user's files; saving there is a download, #176).
+    /// (a page can't write to the user's files; saving there is a download, #176). An Android host
+    /// whose `download` writes through the document's current SAF URI sets
+    /// [`Services::autosave_through_download`] so AutoSave may keep that file up to date.
     pub fn autosave_block(&self) -> Option<AutoSaveBlock> {
-        if self.services.download.is_some() {
+        if self.services.download.is_some() && !self.services.autosave_through_download {
             return Some(AutoSaveBlock::Browser);
         }
         let Some(path) = &self.session.path else { return Some(AutoSaveBlock::Unsaved) };
@@ -2145,10 +2254,17 @@ impl WordApp {
     fn autosave_tick(&mut self, now: f64) {
         if self.autosaves() && self.session.dirty && now - self.last_autosave > 2500.0 && now - self.canvas.caret_visible_since > 1500.0 {
             self.last_autosave = now;
-            if let Err(e) = self.session.run("file.save", &json!({})) {
+            // Android writes the document through its host (SAF); `run` goes through `download`.
+            // Desktop AutoSave keeps using the session directly, so nothing else changes.
+            let saved = if self.services.autosave_through_download {
+                self.run("file.save", json!({}))
+            } else {
+                self.session.run("file.save", &json!({})).map_err(|e| e.to_string())
+            };
+            if let Err(e) = saved {
                 log::warn!("AutoSave failed: {e}");
                 self.autosave_path = None;
-                self.status(i18n::fmt(tl!("AutoSave failed: {error}. Save the document to turn AutoSave back on."), &[("error", &e.to_string())]));
+                self.status(i18n::fmt(tl!("AutoSave failed: {error}. Save the document to turn AutoSave back on."), &[("error", &e)]));
             }
         }
     }
@@ -5701,6 +5817,50 @@ mod tests {
         assert_eq!(mixed.recent_fonts, ["Arial", "Georgia"]);
     }
 
+    /// Android stores each recent document's SAF URI beside its display name. The map survives
+    /// `ui.json`, drops junk, and loses entries that fall off the list; old files still read.
+    #[test]
+    fn recent_document_locations_round_trip_and_junk_is_dropped() {
+        let mut ui = UiState::default();
+        assert!(ui.recent_uris.is_empty());
+        ui.recent = vec!["Notes.docx".into(), "Old.docx".into()];
+        ui.remember_recent_uri("Notes.docx", "content://com.example.notes/1");
+        ui.remember_recent_uri("Notes.docx", "javascript:alert(1)");
+        ui.remember_recent_uri("Notes.docx", "  ");
+        ui.remember_recent_uri("", "content://com.example/x");
+        ui.remember_recent_uri("Huge.docx", &format!("content://{}", "a".repeat(MAX_RECENT_URI_BYTES)));
+        assert_eq!(ui.recent_uri("Notes.docx"), Some("content://com.example.notes/1"));
+        assert_eq!(ui.recent_uri("Huge.docx"), None);
+
+        let saved = serde_json::to_string(&ui).unwrap();
+        assert!(saved.contains(r#""recentUris":{"Notes.docx":"content://com.example.notes/1"}"#), "{saved}");
+        let back = UiState::from_json(saved.as_bytes()).unwrap();
+        assert_eq!(back.recent_uri("Notes.docx"), Some("content://com.example.notes/1"));
+        // A ui.json from before the map has none; a wrong type keeps the default.
+        assert!(UiState::from_json(br#"{"recent": ["Notes.docx"]}"#).unwrap().recent_uris.is_empty());
+        assert!(UiState::from_json(br#"{"recentUris": "content://x"}"#).unwrap().recent_uris.is_empty());
+        // One junk entry drops itself, not the whole map.
+        let mixed = UiState::from_json(br#"{"recent": ["A"], "recentUris": {"A": "file:///tmp/a.docx", "B": "content://x", "C": 7}}"#).unwrap();
+        assert_eq!(mixed.recent_uri("A"), Some("file:///tmp/a.docx"));
+        assert_eq!(mixed.recent_uri("B"), Some("content://x"), "pruning waits for apply_prefs");
+
+        // Applying prefs keeps only locations whose entry is still in Recent.
+        let mut a = app();
+        a.apply_prefs(mixed);
+        assert_eq!(a.ui.recent_uri("A"), Some("file:///tmp/a.docx"));
+        assert_eq!(a.ui.recent_uri("B"), None);
+        // New entries push the list, and locations that fall off it go too.
+        a.ui.recent = vec!["A".into()];
+        a.ui.recent_uris.insert("A".into(), "file:///tmp/a.docx".into());
+        for i in 0..=MAX_RECENT {
+            a.note_recent(&format!("doc{i}.docx"));
+        }
+        assert_eq!(a.ui.recent.len(), MAX_RECENT);
+        let newest = format!("doc{MAX_RECENT}");
+        assert_eq!(a.ui.recent.first().map(String::as_str), Some(newest.as_str()));
+        assert!(a.ui.recent_uri("A").is_none());
+    }
+
     /// #2068 review: a hand-edited `ui.json` with a huge list or huge names read back slowly and
     /// kept a multi-megabyte name, and the Font dialog applies names of any length; neither is
     /// kept. Reading stops at ten names.
@@ -6614,6 +6774,59 @@ mod tests {
         assert!(!a.autosaves());
         let err = a.run("file.autosave", json!({"value": true})).unwrap_err();
         assert!(err.contains("browser"), "{err}");
+    }
+
+    /// Android's SAF host sets `autosave_through_download`: once the document's own file has been
+    /// written (and the host set its display name), AutoSave keeps that file up to date through
+    /// the same download path. A cancelled or failed write never turns it on.
+    #[test]
+    fn autosave_can_write_through_a_saf_document() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let saves = async_saves::AsyncSaves::default();
+        let started = Rc::new(Cell::new(0));
+        let writes = Rc::new(Cell::new(0));
+        let fail = Rc::new(Cell::new(false));
+        let hook_saves = saves.clone();
+        let hook_started = started.clone();
+        let hook_writes = writes.clone();
+        let hook_fail = fail.clone();
+        let services = Services {
+            download: Some(Box::new(move |_: &str, _: &[u8]| {
+                hook_writes.set(hook_writes.get().saturating_add(1));
+                if hook_fail.get() {
+                    return Err("permission revoked".into());
+                }
+                hook_started.set(hook_saves.start());
+                Ok(())
+            })),
+            async_saves: Some(saves.clone()),
+            autosave_through_download: true,
+            ..Default::default()
+        };
+        let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), services);
+        // AndroidShell sets the display name when the successful write comes back.
+        a.session.path = Some("Notes.docx".into());
+        a.run("file.save", json!({})).unwrap();
+        assert_eq!(a.autosave_block(), Some(AutoSaveBlock::NotSavedHere), "a write that is still unconfirmed doesn't count");
+        saves.finish(started.get(), async_saves::SaveOutcome::Saved);
+        a.settle_async_saves();
+        assert_eq!(a.autosave_block(), None);
+        assert!(a.autosaves());
+
+        a.run("text.insert", json!({"text": "More "})).unwrap();
+        a.autosave_tick(now_ms() + 10_000.0);
+        assert_eq!(writes.get(), 2, "AutoSave went through the host's SAF download");
+        assert!(!a.session.dirty);
+
+        // A failed host write turns AutoSave off with the normal message.
+        fail.set(true);
+        a.run("text.insert", json!({"text": "and "})).unwrap();
+        a.autosave_tick(now_ms() + 20_000.0);
+        assert_eq!(a.autosave_block(), Some(AutoSaveBlock::NotSavedHere), "AutoSave stops covering the file");
+        let status = a.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        assert!(status.contains("AutoSave failed"), "{status}");
     }
 
     /// Cancelling the Open picker (Mod+O) left the document as it was but turned AutoSave off.

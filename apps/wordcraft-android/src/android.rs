@@ -52,6 +52,13 @@ impl AndroidShell {
                 self.app.status(format!("Couldn't open {name}: the file is empty."));
                 continue;
             }
+            // The URI is what File › Home must reopen: `session.path` is only a display name on
+            // Android, so remember the location beside it before the document is drained.
+            if let Some(name) = clean_name(&result.name)
+                && let Some(uri) = wordcraft_ui_egui::clean_recent_uri(&result.uri)
+            {
+                self.app.ui.remember_recent_uri(&name, &uri);
+            }
             let inbox = self.inbox.clone();
             let mut files = lock(&inbox);
             if files.len() < MAX_INBOX_FILES {
@@ -72,19 +79,24 @@ impl AndroidShell {
                 SaveOutcome::Failed(result.error.clone())
             };
             if result.ok && set_current {
-                self.note_saved_document(&result.name);
+                self.note_saved_document(&result.name, &result.uri);
             }
             self.saves.finish(result.ticket, outcome);
         }
     }
 
     /// A document written through SAF is the document the app is editing: its display name
-    /// becomes the title. `session.path` is only a name on Android; writes always go through the
-    /// current SAF URI held by Java. Recent files need a stored URI to reopen, which this arc
-    /// does not have yet, so they are deliberately not added here.
-    fn note_saved_document(&mut self, name: &str) {
+    /// becomes the title and its URI lets File › Home reopen it. `session.path` is only a name on
+    /// Android; writes always go through the current SAF URI held by Java.
+    fn note_saved_document(&mut self, name: &str, uri: &str) {
         let Some(name) = clean_name(name) else { return };
         self.app.session.path = Some(PathBuf::from(&name));
+        if let Some(uri) = wordcraft_ui_egui::clean_recent_uri(uri) {
+            self.app.ui.remember_recent_uri(&name, &uri);
+        }
+        // File › Home updates when a save command runs, but a new document's name only arrives
+        // with this result. Add it here too (once, at the front).
+        self.app.push_recent(&name);
     }
 }
 
@@ -357,7 +369,6 @@ fn clean_name(name: &str) -> Option<String> {
 /// A file the Java picker read, waiting for the UI thread to hand it to the app.
 struct OpenResult {
     name: String,
-    #[allow(dead_code)]
     uri: String,
     bytes: Vec<u8>,
     error: String,
@@ -369,7 +380,6 @@ struct SaveResult {
     ok: bool,
     cancelled: bool,
     name: String,
-    #[allow(dead_code)]
     uri: String,
     error: String,
 }
@@ -441,6 +451,8 @@ fn repaint_ui() {
 fn android_services(android: &AndroidApp, inbox: Inbox, saves: AsyncSaves) -> Services {
     let open_android = android.clone();
     let save_android = android.clone();
+    let open_uri_android = android.clone();
+    let forget_android = android.clone();
     let download_saves = saves.clone();
     Services {
         open_async: Some(Box::new(move |purpose: &str| launch_open(&open_android, purpose))),
@@ -459,6 +471,14 @@ fn android_services(android: &AndroidApp, inbox: Inbox, saves: AsyncSaves) -> Se
             Ok(())
         })),
         async_saves: Some(saves),
+        // SAF writes through the document's current URI, so AutoSave keeps that file up to date
+        // after the user has saved it here; a failed write still turns it off in the UI.
+        autosave_through_download: true,
+        open_uri: Some(Box::new(move |uri: &str| {
+            launch_open_uri(&open_uri_android, uri);
+            Ok(())
+        })),
+        forget_document: Some(Box::new(move || launch_forget_document(&forget_android))),
         ..Default::default()
     }
 }
@@ -509,6 +529,34 @@ fn launch_save(android: &AndroidApp, bytes: &[u8], name: &str, set_current: bool
             Ok(())
         });
     }));
+}
+
+/// Reopens a recent document by the SAF URI Java stored with it.
+fn launch_open_uri(android: &AndroidApp, uri: &str) {
+    let android = android.clone();
+    let uri = uri.to_string();
+    android.run_on_java_main_thread(Box::new(move || {
+        with_activity(&android, |env, activity| {
+            let uri = JString::new(env, &uri)?;
+            env.call_method(
+                activity,
+                jni::jni_str!("startOpenUri"),
+                jni::jni_sig!("(Ljava/lang/String;)V"),
+                &[JValue::Object(uri.as_ref())],
+            )?;
+            Ok(())
+        });
+    }));
+}
+
+/// A new document replaced the old one; Java must forget the old document's URI so Save asks
+/// where to write instead of overwriting it. Called straight away rather than queued, so a Save
+/// in the same frame can't still see the previous document's URI.
+fn launch_forget_document(android: &AndroidApp) {
+    with_activity(android, |env, activity| {
+        env.call_method(activity, jni::jni_str!("forgetCurrentDocument"), jni::jni_sig!("()V"), &[])?;
+        Ok(())
+    });
 }
 
 /// Runs `call` on the Java main thread with the activity. Every failure is logged; none panic.
@@ -611,18 +659,29 @@ pub fn android_main(app: AndroidApp) {
             let inbox = Inbox::default();
             let saves = AsyncSaves::default();
             let services = android_services(&android_for_services, inbox.clone(), saves.clone());
-            let mut prefs = PrefsStore::new(data_dir);
+            let mut prefs = PrefsStore::new(data_dir.clone());
 
             // Android starts on File > Home, not on a built-in sample. The placeholder document
             // stays hidden until Blank document or Open creates or replaces it.
             let mut session = Session::new(wordcraft_engine::doc::Document::new());
             session.system_region = wordcraft_ui_egui::i18n::system_region();
+            // Local recovery keeps unsaved typing across process death. It has no file path, so a
+            // restored document is dirty and Save asks where (or reuses the host's current URI).
+            if let Some(dir) = data_dir {
+                let wake_ctx = cc.egui_ctx.clone();
+                if let Err(err) = session.enable_recovery(
+                    dir.join("recovery"),
+                    std::sync::Arc::new(move || wake_ctx.request_repaint()),
+                ) {
+                    log::warn!("local recovery is unavailable: {err}");
+                }
+            }
             let mut app = WordApp::new(session, services);
             prefs.restore(&mut app);
             app.start_screen();
-            // SAF save writes through `download`; AutoSave stays off until it can reuse the
-            // current document URI safely on every path.
-            app.autosave = false;
+            // AutoSave keeps its normal default, but the desktop rules still apply: it starts
+            // only once the document has been saved here. From then on `download` writes the
+            // document's current SAF URI, and a failed write turns AutoSave off with a status.
             Ok(Box::new(AndroidShell::new(app, android_for_ui, inbox, saves, prefs)))
         }),
     );
