@@ -625,6 +625,16 @@ pub struct WordApp {
     pub(crate) comment_drafts: panes::CommentDrafts,
 }
 
+/// What Android's Back gesture left for the host to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackGesture {
+    /// The nearest open thing (a dialog, the File page, a drop-down, keytips, a file picker) was
+    /// closed the way Escape closes it; Back is used up.
+    Dismissed,
+    /// Nothing was open: the host should ask to close the document/window, Save Changes included.
+    NothingOpen,
+}
+
 /// The answer to "Do you want to save changes?" (`ui.saveChanges`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveChoice {
@@ -1287,6 +1297,46 @@ impl WordApp {
             return false;
         }
         saved
+    }
+
+    /// Android's Back gesture, after the host has put the soft keyboard away. Closes the nearest
+    /// thing the UI has open the way Escape does — each dialog's own cancellation runs (a Save
+    /// Changes prompt's Cancel, say), rather than this method discarding state behind its back.
+    ///
+    /// Returns [`BackGesture::NothingOpen`] only when there is nothing left to close, which is
+    /// the host's cue to ask to close the document/window through [`WordApp::close_requested`].
+    /// A dialog that doesn't close on Escape (none today) keeps the gesture here, safely.
+    pub fn back_gesture(&mut self, ctx: &egui::Context) -> BackGesture {
+        let open = self.dialog.is_some()
+            || self.colors.is_some()
+            || self.ui.backstage
+            || self.ui.keytips != keytips::Phase::Off
+            || self.file_dialog_open()
+            || egui::Popup::is_any_open(ctx);
+        if !open {
+            return BackGesture::NothingOpen;
+        }
+        // The UI already understands Escape for every one of these (a dialog's Cancel, the File
+        // page's back arrow, an open drop-down, keytips), so drive that one path instead of
+        // closing state here: the Save Changes prompt, for one, must go through `ui.saveChanges`
+        // so the close it was asked about is held or released properly.
+        let modifiers = egui::Modifiers::default();
+        self.synthetic.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        self.synthetic.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers,
+        });
+        ctx.request_repaint();
+        BackGesture::Dismissed
     }
 
     /// The window's close button (or the system) asked to quit. Returns true to let the window
@@ -2183,7 +2233,28 @@ impl WordApp {
     }
 
     /// Lay out the window.
+    ///
+    /// Android feeds the system bars' insets through [`egui::RawInput::safe_area_insets`], which
+    /// [`egui::Context::content_rect`] removes; the ribbon, page and status bar are laid out there
+    /// so the gesture area never covers them. Desktop and web leave the insets at zero, so the
+    /// window is used whole and nothing moves.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let content = ctx.content_rect();
+        if content != ctx.viewport_rect() {
+            // Paint the strip under the system bars first: it is the window's own colour, not a
+            // hole left by the inset layout.
+            let t = theme::Tokens::get(&ctx);
+            ui.painter().rect_filled(ctx.viewport_rect(), 0.0, t.canvas);
+            let mut safe = ui.new_child(egui::UiBuilder::new().max_rect(content));
+            self.window_ui(&mut safe);
+        } else {
+            self.window_ui(ui);
+        }
+    }
+
+    /// The window's layout, inside the safe area ([`WordApp::ui`]).
+    fn window_ui(&mut self, ui: &mut egui::Ui) {
         let t0 = now_ms();
         let ctx = ui.ctx().clone();
         i18n::set_current(i18n::Lang::from_pref(&self.ui.language));
@@ -4816,6 +4887,93 @@ mod tests {
         }
         a.execute("file.close", json!({"force": true})).unwrap();
         assert!(!a.has_document() && !a.quit_requested);
+    }
+
+    /// Android Back never discards unsaved work: with nothing open it is the host's cue to close
+    /// the document/window, which asks first; with the Save Changes prompt up, Back is spent on
+    /// its Cancel, exactly as Escape is.
+    #[test]
+    fn android_back_never_discards_unsaved_work() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0));
+        let mut a = typed();
+        assert_eq!(a.back_gesture(&ctx), BackGesture::NothingOpen);
+        assert!(a.synthetic.is_empty(), "nothing was open, so nothing was sent");
+        assert!(!a.close_requested(), "closing a dirty document asks first");
+        assert_eq!(prompt(&a), Some("saveChanges"));
+
+        assert_eq!(a.back_gesture(&ctx), BackGesture::Dismissed, "the prompt is nearest");
+        assert_eq!(a.synthetic.len(), 2, "one Escape press and release, next frame");
+        // Run the queued Escape through real frames; the dialog answers its own Cancel.
+        let mut t = 0.0;
+        for _ in 0..6 {
+            t += 1.0 / 60.0;
+            let mut input = egui::RawInput { time: Some(t), screen_rect: Some(screen), ..Default::default() };
+            a.raw_input_hook(&mut input);
+            ctx.run_ui(input, |ui| {
+                a.logic(ui.ctx());
+                a.ui(ui);
+            })
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(prompt(&a), None, "Cancel closed the prompt");
+        assert!(a.has_document() && a.session.dirty, "the unsaved work is still there");
+        assert!(!a.quit_requested, "Back did not quit behind the prompt");
+    }
+
+    /// Android Back closes the File page, dialogs, drop-downs and keytips before it can mean
+    /// "close the document"; when nothing is open it leaves the decision to the host.
+    #[test]
+    fn android_back_closes_an_open_overlay_first() {
+        let ctx = egui::Context::default();
+        let mut a = typed();
+        a.ui.backstage = true;
+        assert_eq!(a.back_gesture(&ctx), BackGesture::Dismissed);
+        assert!(a.ui.backstage, "the Escape runs on the next frame, not mid-call");
+        assert!(matches!(a.synthetic.first(), Some(egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
+        a.synthetic.clear();
+        a.ui.backstage = false;
+        assert_eq!(a.back_gesture(&ctx), BackGesture::NothingOpen);
+        assert!(a.synthetic.is_empty());
+    }
+
+    /// Android's system-bar insets move the ribbon, page and status bar inside the safe area, and
+    /// an inset of zero (desktop and web) uses the whole window again.
+    #[test]
+    fn safe_area_insets_keep_the_page_clear_of_the_gesture_area() {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1440.0, 900.0));
+        let insets = egui::SafeAreaInsets(egui::epaint::MarginF32 { left: 10.0, right: 12.0, top: 30.0, bottom: 24.0 });
+        let mut a = typed();
+        let mut t = 0.0;
+        let mut frame = |a: &mut WordApp, insets: egui::SafeAreaInsets| {
+            t += 1.0 / 60.0;
+            ctx.run_ui(
+                egui::RawInput { time: Some(t), screen_rect: Some(screen), safe_area_insets: Some(insets), ..Default::default() },
+                |ui| {
+                    a.logic(ui.ctx());
+                    a.ui(ui);
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..6 {
+            frame(&mut a, insets);
+        }
+        let content = ctx.content_rect();
+        assert_eq!(content.min, pos2(10.0, 30.0));
+        assert_eq!(content.max, pos2(1428.0, 876.0));
+        let canvas = a.canvas.canvas_rect.expect("the page area was laid out");
+        assert!(canvas.min.x >= content.min.x - 0.5 && canvas.min.y >= content.min.y - 0.5, "top/left clear: {canvas:?}");
+        assert!(canvas.max.x <= content.max.x + 0.5 && canvas.max.y <= content.max.y + 0.5, "bottom/right clear: {canvas:?}");
+        let inset_bottom = canvas.max.y;
+
+        for _ in 0..6 {
+            frame(&mut a, egui::SafeAreaInsets::default());
+        }
+        assert_eq!(ctx.content_rect().max.y, 900.0, "no insets means the whole window");
+        let canvas = a.canvas.canvas_rect.expect("the page area was laid out");
+        assert!(canvas.max.y > inset_bottom + 8.0, "with no insets the window is used whole again: {canvas:?}");
     }
 
     /// The window's close button quit at once; now it asks (the host cancels the close on false).
