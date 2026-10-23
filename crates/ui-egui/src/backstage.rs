@@ -394,6 +394,29 @@ pub(crate) fn forget_open_error(ctx: &egui::Context) {
 /// Open a file from the Recent list. A file that can't be opened (deleted, moved, unreadable)
 /// leaves File open so the list can say why, rather than closing it on a greyed-out window.
 fn open_recent(app: &mut WordApp, path: &str) -> Result<(), String> {
+    // Android: the entry is a display name; its SAF URI is what can be reopened. A ui.json from
+    // before locations were stored (or a file opened elsewhere) has none. Desktop and web have
+    // no URI hook and keep opening the filesystem path in `recent`.
+    let uri = if app.services.open_uri.is_some() {
+        Some(
+            app.ui
+                .recent_uri(path)
+                .map(str::to_string)
+                .ok_or_else(|| tl!("This recent document can't be reopened here. Use Open to choose the file again.").to_string())?,
+        )
+    } else {
+        None
+    };
+    if let Some(uri) = uri {
+        if let Some(open) = &app.services.open_uri {
+            open(&uri)?;
+        }
+        // Android: the document arrives through the inbox on a later frame. A successful open
+        // closes File from `drain_inbox`; a failure keeps the list up with the reason on the
+        // status bar, instead of closing on a file that never opened.
+        app.canvas.want_focus = true;
+        return Ok(());
+    }
     app.run("file.open", json!({"path": path}))?;
     app.ui.backstage = false;
     app.canvas.want_focus = true;
