@@ -40,6 +40,12 @@ impl AndroidShell {
 
     /// Moves bytes and save outcomes from the Java picker threads into the app's own queues.
     fn pump_storage_results(&mut self) {
+        // Java reports a document whose stored permission expired (at launch) or a save that had
+        // to fall back to the picker. A notice may arrive before the first frame, so it waits in
+        // the queue until here.
+        while let Some(text) = next_notice() {
+            self.app.status(text);
+        }
         while let Some(result) = next_open() {
             if !result.error.is_empty() {
                 let name = clean_name(&result.name).unwrap_or_else(|| "the file".to_string());
@@ -96,7 +102,7 @@ impl AndroidShell {
         }
         // File › Home updates when a save command runs, but a new document's name only arrives
         // with this result. Add it here too (once, at the front).
-        self.app.push_recent(&name);
+        self.app.note_recent(&name);
     }
 }
 
@@ -263,6 +269,10 @@ impl ImeBridge {
 
 /// Largest number of picked files waiting for the app to open.
 const MAX_INBOX_FILES: usize = 32;
+/// Most storage notices (a stale document, a save that fell back to the picker) kept for the UI.
+const MAX_NOTICES: usize = 8;
+/// Longest storage notice kept: a provider's error text can be long, the status bar is not.
+const MAX_NOTICE_CHARS: usize = 512;
 /// Largest `ui.json` read back from private storage.
 const MAX_PREFS_BYTES: u64 = 1 << 20;
 /// How often changed settings are written while the app runs.
@@ -420,6 +430,30 @@ fn next_save() -> Option<SaveResult> {
     lock(save_results()).pop_front()
 }
 
+/// Messages from Java that belong on the status bar (a stale document at launch, a save that
+/// fell back to the picker). Bounded: an app started with too many only shows the newest.
+fn storage_notices() -> &'static Mutex<VecDeque<String>> {
+    static NOTICES: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+    NOTICES.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn push_notice(text: String) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let text: String = text.chars().take(MAX_NOTICE_CHARS).collect();
+    let mut queue = lock(storage_notices());
+    if queue.len() >= MAX_NOTICES {
+        queue.pop_front();
+    }
+    queue.push_back(text);
+}
+
+fn next_notice() -> Option<String> {
+    lock(storage_notices()).pop_front()
+}
+
 /// The save tickets whose write updates the document's current SAF URI.
 fn pending_saves() -> &'static Mutex<HashMap<u64, bool>> {
     static PENDING: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
@@ -474,6 +508,10 @@ fn android_services(android: &AndroidApp, inbox: Inbox, saves: AsyncSaves) -> Se
         // SAF writes through the document's current URI, so AutoSave keeps that file up to date
         // after the user has saved it here; a failed write still turns it off in the UI.
         autosave_through_download: true,
+        // The built-in browser starts in shared storage and offers the usual folders. Android's
+        // scoped storage refuses most of them without a system grant, so a failed listing says
+        // to use the SAF Open/Save picker instead.
+        browse_locations: Some(Box::new(browse_locations)),
         open_uri: Some(Box::new(move |uri: &str| {
             launch_open_uri(&open_uri_android, uri);
             Ok(())
@@ -486,6 +524,36 @@ fn android_services(android: &AndroidApp, inbox: Inbox, saves: AsyncSaves) -> Se
 fn is_export_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.ends_with(".pdf") || lower.ends_with(".png")
+}
+
+/// Where WordCraft's own browser starts on Android and which shared folders it offers. Direct
+/// file access is only the fast path: without a system grant the listing fails and the browser
+/// shows the permission hint pointing at the SAF Open/Save picker. No broad storage permission
+/// is requested.
+fn browse_locations() -> wordcraft_ui_egui::BrowseLocations {
+    const ROOT: &str = "/storage/emulated/0";
+    let root = std::path::Path::new(ROOT);
+    let mut shortcuts = Vec::new();
+    // Android names the download folder "Download"; accept the plural some devices show too.
+    for (label, name) in [("Downloads", "Download"), ("Downloads", "Downloads"), ("Documents", "Documents"), ("Pictures", "Pictures")] {
+        let path = root.join(name);
+        if !path.is_dir() {
+            continue;
+        }
+        if shortcuts.iter().any(|(shown, existing): &(String, std::path::PathBuf)| shown.as_str() == label || existing == &path) {
+            continue;
+        }
+        shortcuts.push((label.to_string(), path));
+    }
+    wordcraft_ui_egui::BrowseLocations {
+        // The browser shows this even when Android refuses to list it, with the hint below; the
+        // fallbacks (last folder, the document's folder, home) are worse starts on a phone.
+        start: Some(root.to_path_buf()),
+        shortcuts,
+        permission_hint: Some(
+            "Android limits direct folder access. Use File > Open or Save As to choose the file with Android's picker.".to_string(),
+        ),
+    }
 }
 
 fn launch_open(android: &AndroidApp, purpose: &str) {
@@ -538,12 +606,7 @@ fn launch_open_uri(android: &AndroidApp, uri: &str) {
     android.run_on_java_main_thread(Box::new(move || {
         with_activity(&android, |env, activity| {
             let uri = JString::new(env, &uri)?;
-            env.call_method(
-                activity,
-                jni::jni_str!("startOpenUri"),
-                jni::jni_sig!("(Ljava/lang/String;)V"),
-                &[JValue::Object(uri.as_ref())],
-            )?;
+            env.call_method(activity, jni::jni_str!("startOpenUri"), jni::jni_sig!("(Ljava/lang/String;)V"), &[JValue::Object(uri.as_ref())])?;
             Ok(())
         });
     }));
@@ -623,7 +686,27 @@ pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeSaveResul
             let name = name.try_to_string(&*env)?;
             let uri = uri.try_to_string(&*env)?;
             let error = error.try_to_string(&*env)?;
-            push_save(SaveResult { ticket: ticket.max(0) as u64, ok, cancelled, name, uri, error });
+            // This JNI signature passes plain Java booleans (see MainActivity.nativeSaveResult).
+            push_save(SaveResult { ticket: ticket.max(0) as u64, ok: ok != 0, cancelled: cancelled != 0, name, uri, error });
+            repaint_ui();
+            Ok(())
+        })
+        .resolve::<jni::errors::LogErrorAndDefault>();
+}
+
+/// A message from Java for the status bar: the last document's SAF permission expired at launch,
+/// or a Save had to fall back to the picker. Queued until the UI can show it.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeStorageNotice<'local>(
+    mut unowned_env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    message: JString<'local>,
+) {
+    unowned_env
+        .with_env(|env| -> jni::errors::Result<()> {
+            let message = message.try_to_string(&*env)?;
+            push_notice(message);
             repaint_ui();
             Ok(())
         })
@@ -669,10 +752,7 @@ pub fn android_main(app: AndroidApp) {
             // restored document is dirty and Save asks where (or reuses the host's current URI).
             if let Some(dir) = data_dir {
                 let wake_ctx = cc.egui_ctx.clone();
-                if let Err(err) = session.enable_recovery(
-                    dir.join("recovery"),
-                    std::sync::Arc::new(move || wake_ctx.request_repaint()),
-                ) {
+                if let Err(err) = session.enable_recovery(dir.join("recovery"), std::sync::Arc::new(move || wake_ctx.request_repaint())) {
                     log::warn!("local recovery is unavailable: {err}");
                 }
             }

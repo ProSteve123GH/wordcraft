@@ -95,6 +95,21 @@ use wordcraft_engine::Session;
 pub use control::ControlRequest;
 pub use file_dialogs::{FileDialogAnswer, FileDialogRequest, open_filters};
 
+/// Where the built-in file browser starts and the folders it offers as shortcuts
+/// ([`Services::browse_locations`]). The default (desktop, web) keeps the browser's own home
+/// folder and recent folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BrowseLocations {
+    /// The folder the first Open/Save As shows (Android: `/storage/emulated/0`).
+    pub start: Option<std::path::PathBuf>,
+    /// Shortcut buttons beside the folder field, as (label, folder). Only existing folders are
+    /// shown; junk or missing folders are dropped.
+    pub shortcuts: Vec<(String, std::path::PathBuf)>,
+    /// Shown when a folder can't be read: how to reach the document another way (Android: use
+    /// the system Open/Save picker).
+    pub permission_hint: Option<String>,
+}
+
 /// Platform services injected by the host (file dialogs, file I/O).
 #[derive(Default)]
 pub struct Services {
@@ -112,6 +127,10 @@ pub struct Services {
     /// sender counts as cancelled. An `Err` says no system dialog could be shown, and the app shows
     /// its built-in file browser instead (#576). The app shows one dialog at a time ([`file_dialogs`]).
     pub file_dialog: Option<Box<dyn Fn(FileDialogRequest) -> std::sync::mpsc::Receiver<FileDialogAnswer>>>,
+    /// Android: where the built-in file browser starts, its shortcut folders and what it says
+    /// when scoped storage refuses a folder. `None` (desktop, web) keeps the browser's usual
+    /// home/recent folder and message.
+    pub browse_locations: Option<Box<dyn Fn() -> BrowseLocations>>,
     /// Web: open a file picker; the file arrives later through `inbox`.
     pub open_async: Option<Box<dyn Fn(&str)>>,
     /// Web: files (name, bytes) delivered asynchronously (picker, drag and drop).
@@ -207,6 +226,8 @@ struct SaveInFlight {
     document: u64,
     /// Whether it marked the document saved (a Save in a format that keeps everything).
     marked_saved: bool,
+    /// Whether AutoSave started it: a failure or cancel turns AutoSave off with a status.
+    autosave: bool,
 }
 
 /// Web: the command a Save Changes prompt holds back until its picker save ends.
@@ -1072,7 +1093,7 @@ impl WordApp {
             // the document's save isn't confirmed.
             if let Some(ticket) = saves.as_ref().and_then(async_saves::AsyncSaves::take_started) {
                 let document = self.session.document_id();
-                self.saves_in_flight.push(SaveInFlight { ticket, name: name.clone(), document, marked_saved });
+                self.saves_in_flight.push(SaveInFlight { ticket, name: name.clone(), document, marked_saved, autosave: false });
                 return Ok(json!({"downloaded": name, "bytes": bytes.len(), "pendingSave": ticket}));
             }
             return Ok(json!({"downloaded": name, "bytes": bytes.len()}));
@@ -1333,12 +1354,38 @@ impl WordApp {
                         if save.marked_saved && save.document == current {
                             self.session.dirty = true;
                         }
+                        // Android: AutoSave writes the document's own file. If that write failed
+                        // or was cancelled (the file moved, its permission was revoked, the
+                        // provider refused), stop retrying and say so; the status asks the user to
+                        // save and turn it back on. Desktop/web keep their existing behaviour.
+                        if save.autosave && self.services.autosave_through_download && save.document == current {
+                            self.autosave = false;
+                            self.session.autosave = false;
+                            self.autosave_path = None;
+                            let msg = match &outcome {
+                                async_saves::SaveOutcome::Cancelled => {
+                                    tl!("AutoSave stopped because the save was cancelled. AutoSave is off; save the document and turn it on again.")
+                                        .to_string()
+                                }
+                                async_saves::SaveOutcome::Failed(error) => i18n::fmt(
+                                    tl!("AutoSave failed: {error}. AutoSave is off; save the document and turn it on again."),
+                                    &[("error", error)],
+                                ),
+                                async_saves::SaveOutcome::Saved => String::new(),
+                            };
+                            if !msg.is_empty() {
+                                self.status(msg);
+                            }
+                        }
                     }
                 }
                 if let async_saves::SaveOutcome::Failed(error) = &outcome {
                     let msg = i18n::fmt(tl!("Couldn't download {name}: {error}"), &[("name", &save.name), ("error", error)]);
                     log::error!("the save picker couldn't save {}: {error}", save.name);
-                    self.status(msg);
+                    // AutoSave's own message above is the useful one for an AutoSave failure.
+                    if !save.autosave {
+                        self.status(msg);
+                    }
                 }
             }
             let Some(wait) = self.awaiting_save.take_if(|w| w.ticket == ticket) else { continue };
@@ -2257,14 +2304,31 @@ impl WordApp {
             // Android writes the document through its host (SAF); `run` goes through `download`.
             // Desktop AutoSave keeps using the session directly, so nothing else changes.
             let saved = if self.services.autosave_through_download {
-                self.run("file.save", json!({}))
+                let result = self.run("file.save", json!({}));
+                // The write finishes later (a SAF ticket): remember that this save is AutoSave's,
+                // so a failed or cancelled write stops it instead of retrying forever.
+                if let Ok(v) = &result
+                    && let Some(ticket) = v.get("pendingSave").and_then(Value::as_u64)
+                    && let Some(save) = self.saves_in_flight.iter_mut().find(|s| s.ticket == ticket)
+                {
+                    save.autosave = true;
+                }
+                result
             } else {
                 self.session.run("file.save", &json!({})).map_err(|e| e.to_string())
             };
             if let Err(e) = saved {
                 log::warn!("AutoSave failed: {e}");
                 self.autosave_path = None;
-                self.status(i18n::fmt(tl!("AutoSave failed: {error}. Save the document to turn AutoSave back on."), &[("error", &e)]));
+                // Android's AutoSave switch follows the write: off, not just ineffective.
+                let message = if self.services.autosave_through_download {
+                    self.autosave = false;
+                    self.session.autosave = false;
+                    tl!("AutoSave failed: {error}. AutoSave is off; save the document and turn it on again.")
+                } else {
+                    tl!("AutoSave failed: {error}. Save the document to turn AutoSave back on.")
+                };
+                self.status(i18n::fmt(message, &[("error", &e)]));
             }
         }
     }
@@ -6825,8 +6889,65 @@ mod tests {
         a.run("text.insert", json!({"text": "and "})).unwrap();
         a.autosave_tick(now_ms() + 20_000.0);
         assert_eq!(a.autosave_block(), Some(AutoSaveBlock::NotSavedHere), "AutoSave stops covering the file");
+        assert!(!a.autosave && !a.session.autosave, "Android's AutoSave switch turns itself off");
         let status = a.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
         assert!(status.contains("AutoSave failed"), "{status}");
+    }
+
+    /// Android's AutoSave write finishes later (a SAF ticket). A failed or cancelled write stops
+    /// AutoSave (rather than retrying forever), leaves the document unsaved and says why.
+    #[test]
+    fn autosave_stops_when_its_saf_write_fails_or_is_cancelled() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let saves = async_saves::AsyncSaves::default();
+        let ticket = Rc::new(Cell::new(0));
+        let hook_saves = saves.clone();
+        let hook_ticket = ticket.clone();
+        let services = Services {
+            download: Some(Box::new(move |_: &str, _: &[u8]| {
+                hook_ticket.set(hook_saves.start());
+                Ok(())
+            })),
+            async_saves: Some(saves.clone()),
+            autosave_through_download: true,
+            ..Default::default()
+        };
+        let mut a = WordApp::new(Session::new(wordcraft_doc::Document::new()), services);
+        a.session.path = Some("Notes.docx".into());
+        // The first, manual Save confirms the document's own file.
+        a.run("file.save", json!({})).unwrap();
+        saves.finish(ticket.get(), async_saves::SaveOutcome::Saved);
+        a.settle_async_saves();
+        assert!(a.autosaves());
+
+        // AutoSave's write is still in the host when the failure arrives.
+        a.run("text.insert", json!({"text": "More "})).unwrap();
+        a.autosave_tick(now_ms() + 10_000.0);
+        assert!(a.autosaves(), "an unconfirmed AutoSave stays switched on");
+        saves.finish(ticket.get(), async_saves::SaveOutcome::Failed("permission revoked".into()));
+        a.settle_async_saves();
+        assert!(!a.autosave && !a.session.autosave);
+        assert!(a.session.dirty, "the failed write did not save the document");
+        assert_eq!(a.autosave_block(), Some(AutoSaveBlock::NotSavedHere));
+        let status = a.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        assert!(status.contains("AutoSave failed") && status.contains("permission revoked"), "{status}");
+
+        // Saving restores AutoSave's coverage; the user switches it on again (the status says so).
+        a.run("file.save", json!({})).unwrap();
+        saves.finish(ticket.get(), async_saves::SaveOutcome::Saved);
+        a.settle_async_saves();
+        assert!(!a.autosaves(), "the failed write switched AutoSave off");
+        a.run("file.autosave", json!({"value": true})).unwrap();
+        assert!(a.autosaves());
+        a.run("text.insert", json!({"text": "again "})).unwrap();
+        a.autosave_tick(now_ms() + 20_000.0);
+        saves.finish(ticket.get(), async_saves::SaveOutcome::Cancelled);
+        a.settle_async_saves();
+        assert!(!a.autosave && a.session.dirty);
+        let status = a.status_msg.as_ref().map(|(m, _)| m.clone()).unwrap_or_default();
+        assert!(status.contains("cancelled"), "{status}");
     }
 
     /// Cancelling the Open picker (Mod+O) left the document as it was but turned AutoSave off.

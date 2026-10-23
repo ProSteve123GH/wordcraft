@@ -411,9 +411,13 @@ fn open_recent(app: &mut WordApp, path: &str) -> Result<(), String> {
         if let Some(open) = &app.services.open_uri {
             open(&uri)?;
         }
-    } else {
-        app.run("file.open", json!({"path": path}))?;
+        // Android: the document arrives through the inbox on a later frame. A successful open
+        // closes File from `drain_inbox`; a failure keeps the list up with the reason on the
+        // status bar, instead of closing on a file that never opened.
+        app.canvas.want_focus = true;
+        return Ok(());
     }
+    app.run("file.open", json!({"path": path}))?;
     app.ui.backstage = false;
     app.canvas.want_focus = true;
     Ok(())

@@ -13,12 +13,16 @@ use egui::{Align2, Rect, Sense, Ui, pos2, vec2};
 
 use crate::file_dialogs::{AfterPick, FileDialogRequest, open_filters};
 use crate::theme::{Tokens, regular};
-use crate::{WordApp, icons};
+use crate::{BrowseLocations, WordApp, icons};
 
 /// At most this many entries are listed; a bigger folder shows the first ones and says so.
 const MAX_LISTED: usize = 5000;
 /// At most this many folder entries are read, so a huge folder can't stall the window.
 const MAX_SCANNED: usize = 100_000;
+/// Most shortcut folders shown beside the folder field.
+const MAX_SHORTCUTS: usize = 6;
+/// Longest shortcut label kept from the host.
+const MAX_SHORTCUT_LABEL: usize = 64;
 const ROW: f32 = 24.0;
 
 /// The browser while it is open, and the folder it showed last (where it opens next time).
@@ -142,6 +146,12 @@ pub(crate) struct FileBrowser {
     selected: Option<PathBuf>,
     note: Note,
     focus_name: bool,
+    /// The host's home folder (Android: the shared storage root), when it has one.
+    home_dir: Option<PathBuf>,
+    /// The host's shortcut folders (Android: Downloads, Documents, Pictures).
+    shortcuts: Vec<(String, PathBuf)>,
+    /// What to say when a folder can't be read because the OS refuses it.
+    permission_hint: Option<String>,
 }
 
 impl FileBrowser {
@@ -170,9 +180,39 @@ impl FileBrowser {
             selected: None,
             note: Note::None,
             focus_name: true,
+            home_dir: None,
+            shortcuts: Vec::new(),
+            permission_hint: None,
         };
         b.navigate(start);
         b
+    }
+
+    /// Use the host's start folder, shortcuts and permission hint (Android). The start is taken
+    /// as given (it is the folder the host wants to show, readable or not); junk shortcuts are
+    /// dropped: one must be an existing folder with a short, non-empty label, and the list is
+    /// bounded so a bad host can't crowd the window.
+    pub(crate) fn use_host(&mut self, host: BrowseLocations) {
+        self.home_dir = host.start.filter(|d| !d.as_os_str().is_empty());
+        self.permission_hint = host.permission_hint.filter(|h| !h.trim().is_empty()).map(|h| h.chars().take(512).collect());
+        self.shortcuts.clear();
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for (label, path) in host.shortcuts {
+            if self.shortcuts.len() >= MAX_SHORTCUTS {
+                break;
+            }
+            let label = label.trim();
+            if label.is_empty() || !path.is_dir() || seen.contains(&path) {
+                continue;
+            }
+            if let Some(home) = &self.home_dir
+                && &path == home
+            {
+                continue;
+            }
+            seen.push(path.clone());
+            self.shortcuts.push((label.chars().take(MAX_SHORTCUT_LABEL).collect(), path));
+        }
     }
 
     fn exts(&self) -> &[String] {
@@ -258,16 +298,22 @@ impl FileBrowser {
 impl WordApp {
     /// Ask for a file in the built-in browser and do `after` with the answer when it closes.
     pub(crate) fn show_file_browser(&mut self, req: FileDialogRequest, after: AfterPick, unavailable: bool) {
+        // Android's shared storage (/storage/emulated/0) is the useful start; desktop and web
+        // leave the host hook unset and keep the last folder, the document's folder, then home.
+        let host = self.services.browse_locations.as_ref().map(|f| f()).unwrap_or_default();
         let start = self
             .file_browser
             .last_dir
             .clone()
             .filter(|d| d.is_dir())
             .or_else(|| self.session.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).filter(|d| d.is_dir()))
+            .or_else(|| host.start.clone())
             .or_else(home)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("/"));
-        self.file_browser.open = Some(Box::new(FileBrowser::new(req, after, start, unavailable)));
+        let mut browser = FileBrowser::new(req, after, start, unavailable);
+        browser.use_host(host);
+        self.file_browser.open = Some(Box::new(browser));
     }
 
     /// `ui.fileBrowser`: the built-in browser for `purpose` (document, picture, recipients, save),
@@ -340,10 +386,18 @@ fn body(ui: &mut Ui, b: &mut FileBrowser, t: &Tokens) -> Option<Option<PathBuf>>
         if icon_button(ui, t, "chevronUp", tl!("Up one level"), b.dir.parent().is_some()) {
             b.up();
         }
+        let host_home = b.home_dir.clone();
         if icon_button(ui, t, "homeFolder", tl!("Home folder"), true)
-            && let Some(h) = home()
+            && let Some(h) = host_home.or_else(home)
         {
             b.navigate(h);
+        }
+        let shortcuts = b.shortcuts.clone();
+        for (label, path) in shortcuts {
+            let button = ui.small_button(crate::i18n::t(&label));
+            if button.on_hover_text(path.display().to_string()).clicked() {
+                b.navigate(path);
+            }
         }
         let r = ui.add(egui::TextEdit::singleline(&mut b.location).desired_width(f32::INFINITY));
         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -411,7 +465,16 @@ fn body(ui: &mut Ui, b: &mut FileBrowser, t: &Tokens) -> Option<Option<PathBuf>>
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             Some((crate::i18n::fmt(tl!("{name} already exists. Choose Save again to replace it."), &[("name", &name)]), t.red))
         }
-        (Err(e), _) => Some((crate::i18n::fmt(tl!("This folder can't be read: {error}"), &[("error", e)]), t.red)),
+        (Err(e), _) => {
+            // Android's scoped storage refuses most folders without a system grant; point the
+            // user at the SAF Open/Save picker rather than leaving a bare error.
+            let mut text = crate::i18n::fmt(tl!("This folder can't be read: {error}"), &[("error", e)]);
+            if let Some(hint) = &b.permission_hint {
+                text.push('\n');
+                text.push_str(hint);
+            }
+            Some((text, t.red))
+        }
         (Ok(l), _) if l.truncated => {
             Some((crate::i18n::fmt(tl!("Showing the first {count} items."), &[("count", &l.entries.len().to_string())]), t.text_dim))
         }
@@ -517,6 +580,46 @@ mod tests {
         assert!(capped.truncated);
         assert!(list_dir(&dir.join("missing"), &exts(&["*"]), 10).is_err(), "an unreadable folder is an error, not a panic");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Android: the host sets the shared-storage root and shortcut folders. Missing or duplicate
+    /// folders and empty labels are dropped, the list is bounded, and the root is trusted even
+    /// when it can't be read (the browser shows why, and the permission hint says what to do).
+    #[test]
+    fn host_locations_are_used_and_junk_is_dropped() {
+        let root = scratch("host-locations");
+        for name in ["Download", "Documents", "Pictures"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+        }
+        let mut b = FileBrowser::new(FileDialogRequest::Open { purpose: "document".into() }, AfterPick::OpenDocument, root.clone(), false);
+        b.use_host(crate::BrowseLocations {
+            start: Some(root.clone()),
+            shortcuts: vec![
+                ("Downloads".into(), root.join("Download")),
+                ("Downloads again".into(), root.join("Download")),
+                ("Missing".into(), root.join("Missing")),
+                ("".into(), root.join("Documents")),
+                ("Documents".into(), root.join("Documents")),
+                ("Pictures".into(), root.join("Pictures")),
+                ("Root".into(), root.clone()),
+            ],
+            permission_hint: Some("Use the system Open picker.".into()),
+        });
+        assert_eq!(b.home_dir.as_deref(), Some(root.as_path()));
+        let labels: Vec<&str> = b.shortcuts.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["Downloads", "Documents", "Pictures"]);
+        assert_eq!(b.permission_hint.as_deref(), Some("Use the system Open picker."));
+
+        // A start that isn't readable is still the folder the host wants shown; junk shortcuts
+        // next to it are dropped.
+        let missing = root.join("nowhere");
+        b.use_host(crate::BrowseLocations { start: Some(missing.clone()), shortcuts: vec![("Nowhere".into(), missing)], permission_hint: None });
+        assert_eq!(b.home_dir.as_deref(), Some(missing.as_path()));
+        assert!(b.shortcuts.is_empty());
+        // An empty start is not a folder to show.
+        b.use_host(crate::BrowseLocations { start: Some(PathBuf::new()), shortcuts: Vec::new(), permission_hint: None });
+        assert!(b.home_dir.is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Save As in the browser: a typed folder is opened, a bare name gets the type's extension,

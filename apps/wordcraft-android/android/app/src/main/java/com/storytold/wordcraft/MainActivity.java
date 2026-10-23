@@ -2,6 +2,7 @@ package com.storytold.wordcraft;
 
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.UriPermission;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
@@ -20,6 +21,7 @@ import androidx.core.view.WindowInsetsControllerCompat;
 import com.google.androidgamesdk.GameActivity;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -54,6 +56,8 @@ public final class MainActivity extends GameActivity {
     private static final int MAX_MULTI_FILES = 20;
     /** Longest display name handed to the engine. */
     private static final int MAX_NAME_CHARS = 255;
+    /** Longest status message handed back to the engine. */
+    private static final int MAX_NOTICE_CHARS = 300;
 
     /** Private storage for the document last opened or saved, so it survives process death. */
     private static final String PREFS_DOCUMENT = "wordcraft.document";
@@ -192,15 +196,14 @@ public final class MainActivity extends GameActivity {
             if (uri != null && canWrite(uri)) {
                 String currentName = currentDocumentName;
                 writeTo(uri, bytes, sanitizeName(currentName == null ? safeName : currentName),
-                        setCurrent, ticket);
+                        setCurrent, ticket, false);
                 return;
             }
             // A permission can be revoked, or the provider can remove the file, while the app is
             // gone. Forget it and fall back to the save picker instead of failing silently.
             Log.w(TAG, "the current document is no longer writable; asking where to save");
             forgetCurrentDocument();
-            Toast.makeText(this, "The document's file is no longer available. Choose where to save.",
-                    Toast.LENGTH_LONG).show();
+            notifyStorage("The document's file can't be written with the current access. Choose where to save it.");
         }
 
         if (pendingSave != null) {
@@ -238,14 +241,18 @@ public final class MainActivity extends GameActivity {
             nativeOpenResult(new byte[0], "", "", "the recent document's location is no longer valid");
             return;
         }
+        // Best effort: take the grant the system already keeps for this URI. Taking flags the
+        // provider never granted would make the call throw and renew nothing, so ask only for
+        // the modes in the persisted permission.
+        int persisted = persistedFlags(uri);
+        if (persisted != 0) {
+            takePersistablePermission(uri, persisted);
+        }
         if (!canRead(uri)) {
             nativeOpenResult(new byte[0], "", uri.toString(),
                     "access to this document has expired; open it again with Open");
             return;
         }
-        // Best effort: a provider that still has a live grant can persist it again.
-        takePersistablePermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
-                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
         new Thread(() -> readOpenUri(uri, true), "wordcraft-open").start();
     }
 
@@ -298,8 +305,7 @@ public final class MainActivity extends GameActivity {
         }
 
         boolean document = "document".equals(openPurpose);
-        int flags = data.getFlags()
-                & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        int flags = grantFlags(data);
         for (Uri uri : uris) {
             takePersistablePermission(uri, flags);
         }
@@ -340,24 +346,96 @@ public final class MainActivity extends GameActivity {
             return;
         }
         Uri uri = data.getData();
-        takePersistablePermission(uri, data.getFlags()
-                & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION));
+        takePersistablePermission(uri, grantFlags(data));
         // The provider may have renamed the file to avoid a clash; save under the name it chose.
         String name = displayName(uri);
-        writeTo(uri, save.data, name, save.setCurrent, save.ticket);
+        writeTo(uri, save.data, name, save.setCurrent, save.ticket, true);
+    }
+
+    /**
+     * The read/write modes a picker result granted. When the result carries no flags at all,
+     * ask for both: taking a mode the provider never granted is caught, while a picker that
+     * simply didn't report flags would otherwise lose its grant at the next launch.
+     */
+    private static int grantFlags(Intent data) {
+        int flags = data == null ? 0
+                : data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        return flags == 0 ? (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION) : flags;
     }
 
     private void takePersistablePermission(Uri uri, int flags) {
         int take = flags & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-        if (take == 0) {
+        if (take == 0 || uri == null || !"content".equals(uri.getScheme())) {
             return;
         }
         try {
             getContentResolver().takePersistableUriPermission(uri, take);
-        } catch (SecurityException e) {
+        } catch (Exception e) {
             // Some providers grant only for the current session; the open/save still works.
             Log.w(TAG, "no persistable permission for " + uri, e);
         }
+    }
+
+    /** The read/write flags the system still keeps for {@code uri}, or 0 when it holds none. */
+    private int persistedFlags(Uri uri) {
+        if (uri == null || !"content".equals(uri.getScheme())) {
+            return 0;
+        }
+        int flags = 0;
+        try {
+            for (UriPermission permission : getContentResolver().getPersistedUriPermissions()) {
+                if (permission == null || !uri.equals(permission.getUri())) {
+                    continue;
+                }
+                if (permission.isReadPermission()) {
+                    flags |= Intent.FLAG_GRANT_READ_URI_PERMISSION;
+                }
+                if (permission.isWritePermission()) {
+                    flags |= Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+                }
+                break;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "cannot read the persisted permissions", e);
+        }
+        return flags;
+    }
+
+    /**
+     * Re-take and verify the permission the last document was opened or saved with. False means
+     * the grant is gone (revoked, or the provider removed the file): the caller forgets the
+     * document and asks the user to choose it again instead of failing on the next Save. A
+     * provider that grants only reading still restores the document; its next Save falls back to
+     * the picker with a message (see startSaveDocument).
+     */
+    private boolean renewCurrentPermission(Uri uri) {
+        if ("file".equals(uri.getScheme())) {
+            return canRead(uri);
+        }
+        int flags = persistedFlags(uri);
+        if (flags != 0) {
+            takePersistablePermission(uri, flags);
+        } else if (!canRead(uri) && !canWrite(uri)) {
+            // No persisted grant and no live one: after a restart the file is out of reach.
+            Log.w(TAG, "no persisted permission for the last document " + uri);
+            return false;
+        }
+        boolean readable = canRead(uri);
+        boolean writable = canWrite(uri);
+        if (!readable && !writable) {
+            Log.w(TAG, "the last document is no longer accessible " + uri);
+            return false;
+        }
+        if (!readable) {
+            // Rare, but a write-only grant still lets Save keep the file up to date.
+            Log.w(TAG, "the last document is write-only " + uri);
+        }
+        if (!writable) {
+            // Read-only grants are common for cloud providers: keep the document, but Save will
+            // ask where (with a message) instead of failing.
+            Log.w(TAG, "the last document is read-only " + uri);
+        }
+        return true;
     }
 
     /** The document last opened or saved, read back after process death. Junk is forgotten. */
@@ -369,13 +447,24 @@ public final class MainActivity extends GameActivity {
             if (uri == null || uri.isEmpty()) {
                 return;
             }
-            if (parseDocumentUri(uri) == null) {
+            Uri parsed = parseDocumentUri(uri);
+            if (parsed == null) {
                 Log.w(TAG, "forgetting the saved document: its location is not supported");
                 forgetCurrentDocument();
                 return;
             }
             currentDocumentUri = uri;
             currentDocumentName = sanitizeName(name);
+            // A URI without its grant is worse than no URI: Save would fail with EACCES/ENOENT.
+            // Verify it now, and forget it so the next Save asks where instead.
+            if (!renewCurrentPermission(parsed)) {
+                Log.w(TAG, "forgetting the saved document: access to " + uri + " has expired");
+                String shown = currentDocumentName;
+                forgetCurrentDocument();
+                notifyStorage("The last document (" + shown
+                        + ") can't be reopened because access has expired. Choose it again with File > Open.");
+                return;
+            }
             Log.i(TAG, "restored the current document " + currentDocumentName);
         } catch (Exception e) {
             Log.w(TAG, "cannot restore the current document", e);
@@ -437,7 +526,13 @@ public final class MainActivity extends GameActivity {
     private boolean canUse(Uri uri, int mode) {
         String scheme = uri.getScheme();
         if ("file".equals(scheme)) {
-            return true;
+            // A plain path has no SAF grant; the file itself has to exist and allow the mode.
+            String path = uri.getPath();
+            if (path == null || path.isEmpty()) {
+                return false;
+            }
+            File file = new File(path);
+            return mode == Intent.FLAG_GRANT_READ_URI_PERMISSION ? file.canRead() : file.canWrite();
         }
         if (!"content".equals(scheme)) {
             return false;
@@ -451,16 +546,27 @@ public final class MainActivity extends GameActivity {
         }
     }
 
-    private void writeTo(Uri uri, byte[] data, String name, boolean setCurrent, long ticket) {
+    /**
+     * Writes {@code data} to {@code uri} on a worker thread. {@code fromPicker} separates a file
+     * the user just chose from the document's own URI: when writing the latter fails (the file
+     * was deleted, its grant revoked, the provider moved it), the save falls back to the picker
+     * with a message instead of reporting a failure the user can't act on.
+     */
+    private void writeTo(Uri uri, byte[] data, String name, boolean setCurrent, long ticket,
+                         boolean fromPicker) {
         new Thread(() -> {
             boolean ok = false;
             String error = "";
-            try (OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
-                if (out == null) {
-                    throw new IOException("the provider returned no stream");
+            try {
+                try (OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
+                    if (out == null) {
+                        throw new IOException("the provider returned no stream");
+                    }
+                    out.write(data);
+                    out.flush();
                 }
-                out.write(data);
-                out.flush();
+                // Only a write whose stream also closed cleanly counts: providers flush to disk
+                // or the cloud on close, so an exception there means the save did not happen.
                 ok = true;
             } catch (Exception e) {
                 Log.e(TAG, "cannot write " + uri, e);
@@ -469,7 +575,20 @@ public final class MainActivity extends GameActivity {
             if (ok && setCurrent) {
                 setCurrentDocument(uri, name);
             }
-            nativeSaveResult(ticket, ok, false, name, uri.toString(), error);
+            if (ok || fromPicker || !setCurrent) {
+                nativeSaveResult(ticket, ok, false, name, uri.toString(), error);
+                return;
+            }
+            // The document's own URI no longer works: forget it and ask where to save instead.
+            final String reason = error;
+            final byte[] retry = data;
+            final String retryName = name;
+            runOnUiThread(() -> {
+                forgetCurrentDocument();
+                notifyStorage("The document's file couldn't be written (" + reason
+                        + "). Choose where to save it.");
+                startSaveDocument(retry, retryName, setCurrent, true, ticket);
+            });
         }, "wordcraft-save").start();
     }
 
@@ -577,10 +696,39 @@ public final class MainActivity extends GameActivity {
         return text == null || text.isEmpty() ? e.getClass().getSimpleName() : text;
     }
 
+    /**
+     * Put a storage message on WordCraft's status bar (and show a toast, so it is noticed even
+     * before the next frame). Called on the Java main thread; a failure to reach either side is
+     * logged, never thrown: this app must not crash.
+     */
+    private void notifyStorage(String message) {
+        if (message == null) {
+            return;
+        }
+        String text = message.trim();
+        if (text.codePointCount(0, text.length()) > MAX_NOTICE_CHARS) {
+            // Count code points so a long provider message can't be cut through a surrogate pair.
+            text = text.substring(0, text.offsetByCodePoints(0, MAX_NOTICE_CHARS));
+        }
+        Log.i(TAG, "storage: " + text);
+        try {
+            nativeStorageNotice(text);
+        } catch (Throwable t) {
+            Log.w(TAG, "cannot report a storage message to the native side", t);
+        }
+        try {
+            Toast.makeText(this, text, Toast.LENGTH_LONG).show();
+        } catch (Throwable t) {
+            Log.w(TAG, "cannot show a storage message", t);
+        }
+    }
+
     // Implemented by the native library (apps/wordcraft-android/src/android.rs).
     private static native void nativeOpenResult(
             byte[] data, String name, String uri, String error);
 
     private static native void nativeSaveResult(
             long ticket, boolean ok, boolean cancelled, String name, String uri, String error);
+
+    private static native void nativeStorageNotice(String message);
 }
