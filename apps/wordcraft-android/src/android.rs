@@ -676,10 +676,10 @@ fn launch_save(android: &AndroidApp, bytes: &[u8], name: &str, set_current: bool
 
 /// Reopens a recent document by the SAF URI Java stored with it.
 fn launch_open_uri(android: &AndroidApp, uri: &str) {
-    let android = android.clone();
+    let callback = android.clone();
     let uri = uri.to_string();
     android.run_on_java_main_thread(Box::new(move || {
-        with_activity(&android, |env, activity| {
+        with_activity(&callback, |env, activity| {
             let uri = JString::new(env, &uri)?;
             env.call_method(activity, jni::jni_str!("startOpenUri"), jni::jni_sig!("(Ljava/lang/String;)V"), &[JValue::Object(uri.as_ref())])?;
             Ok(())
@@ -762,7 +762,8 @@ pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeSaveResul
             let uri = uri.try_to_string(&*env)?;
             let error = error.try_to_string(&*env)?;
             // This JNI signature passes plain Java booleans (see MainActivity.nativeSaveResult).
-            push_save(SaveResult { ticket: ticket.max(0) as u64, ok: ok != 0, cancelled: cancelled != 0, name, uri, error });
+            // In jni-sys 0.4 `jboolean` is `bool`, so the params arrive already converted.
+            push_save(SaveResult { ticket: ticket.max(0) as u64, ok, cancelled, name, uri, error });
             repaint_ui();
             Ok(())
         })
@@ -813,7 +814,8 @@ pub extern "system" fn Java_com_storytold_wordcraft_MainActivity_nativeImeVisibl
     _class: JClass<'local>,
     visible: jni::sys::jboolean,
 ) {
-    IME_VISIBLE.store(visible != 0, Ordering::SeqCst);
+    // In jni-sys 0.4 `jboolean` is `bool`, so the param arrives already converted.
+    IME_VISIBLE.store(visible, Ordering::SeqCst);
 }
 
 #[allow(unsafe_code)]
