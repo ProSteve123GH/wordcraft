@@ -6,13 +6,15 @@
 //! - touchpad (pixel) deltas move the page 1:1, with no animation;
 //! - after a touchpad flick the page coasts and slows down ([`Momentum`]), on platforms whose
 //!   system doesn't already send momentum events (not macOS, Windows or the web);
-//! - a mouse-wheel notch scrolls about three text lines and eases in over ~0.1 s, like egui.
+//! - a mouse-wheel notch scrolls about three text lines and eases in over ~0.1 s, like egui;
+//! - on a touch screen two fingers pan the page 1:1 and coast when they lift, and a pinch zooms
+//!   around the point between the fingers ([`CanvasScroll::zoom`]).
 //!
 //! With animation effects off ([`crate::theme::Animations`]) nothing eases: a notch scrolls the
 //! page its whole distance at once, and so do egui's own scroll areas ([`unsmoothed_scroll`]).
-//! Ctrl/⌘+wheel zooms in whole steps, each at once ([`CanvasScroll::zoom`]). Touchpad momentum
-//! stays: it carries on the fingers' own movement, as the momentum macOS and Windows send does
-//! whatever their animation setting.
+//! Ctrl/⌘+wheel zooms in whole steps, each at once ([`CanvasScroll::zoom`]), and a pinch applies
+//! each frame's factor as it comes. Touchpad momentum stays: it carries on the fingers' own
+//! movement, as the momentum macOS and Windows send does whatever their animation setting.
 
 use egui::{Event, InputOptions, Modifiers, MouseWheelUnit, TouchPhase, Vec2};
 
@@ -157,6 +159,12 @@ pub struct CanvasScroll {
     /// input time it last grew. Only used with animation effects off.
     zoom_pending: f32,
     zoom_time: f64,
+    /// Two fingers were on the screen last frame, so the frame they lift is the pan's release.
+    touch_panning: bool,
+    /// A pinch's intended scale and the part shown so far, both since the pinch began. Easing the
+    /// shown scale towards the intended one keeps a shaky pinch from jittering the page; `None`
+    /// when no pinch is in progress or catching up. Only used with animation effects on.
+    pinch: Option<(f32, f32)>,
 }
 
 impl CanvasScroll {
@@ -214,16 +222,28 @@ impl CanvasScroll {
             self.hit_edge();
             return Vec2::ZERO;
         }
+        // Two fingers on the glass pan the page 1:1 (one finger belongs to the text: selection,
+        // dragging an object). The average finger movement scrolls the same way a touchpad delta
+        // does, and the same coast follows when they lift, so a flick carries on smoothly.
+        let mut touch_panning = false;
+        if let Some(touch) = input.multi_touch() {
+            touch_panning = true;
+            let d = touch.translation_delta;
+            if d.is_finite() {
+                touchpad += d;
+            }
+        }
         now += touchpad;
         let fed = touchpad != Vec2::ZERO;
         if SYNTH_MOMENTUM {
             if fed {
                 self.momentum.feed(touchpad, dt);
             }
-            if lifted {
+            if lifted || (self.touch_panning && !touch_panning) {
                 self.momentum.release();
             }
         }
+        self.touch_panning = touch_panning;
         // A click, key or wheel notch stops a coast (even one that started this frame).
         if stop {
             self.momentum.cancel();
@@ -255,9 +275,9 @@ impl CanvasScroll {
         self.hit_edge();
     }
 
-    /// Scrolling continues without new input: keep repainting.
+    /// Scrolling or a pinch easing continues without new input: keep repainting.
     pub fn is_animating(&self) -> bool {
-        self.pending != Vec2::ZERO || self.momentum.is_active()
+        self.pending != Vec2::ZERO || self.momentum.is_active() || self.pinch.is_some()
     }
 
     /// This frame's zoom factor from Ctrl/⌘+wheel and pinch gestures (1.0: none). With `animate`
@@ -265,8 +285,37 @@ impl CanvasScroll {
     /// zooms in whole steps ([`ZOOM_STEP`]), each at once, however finely the turns arrive; a
     /// pinch the system reports as a pinch still follows the fingers.
     pub fn zoom(&mut self, input: &egui::InputState, opts: &InputOptions, animate: bool) -> f32 {
-        // Fingers on a touch screen are measured directly, never eased.
-        if animate || input.multi_touch().is_some() {
+        // Two fingers on a touch screen: the pinch follows the fingers, but with animation effects
+        // on each frame eases into the next scale instead of jumping with every shiver. The
+        // intended and shown scales are kept for the whole pinch, so the last part still arrives
+        // after the fingers lift (and the page keeps its anchor point while it does).
+        if let Some(touch) = input.multi_touch() {
+            self.zoom_pending = 0.0;
+            let raw = if touch.zoom_delta.is_finite() && touch.zoom_delta > 0.0 { touch.zoom_delta } else { 1.0 };
+            if !animate {
+                self.pinch = None;
+                return raw;
+            }
+            let (mut target, shown) = self.pinch.unwrap_or((1.0, 1.0));
+            target = (target * raw).clamp(0.2, 5.0);
+            let next = ease_step(shown, target, input.stable_dt);
+            self.pinch = Some((target, next));
+            return pinch_factor(next, shown);
+        }
+        // Fingers have lifted, but the last part of the pinch may still be arriving.
+        if let Some((target, shown)) = self.pinch {
+            self.zoom_pending = 0.0;
+            if !animate {
+                self.pinch = None;
+                return 1.0;
+            }
+            let next = ease_step(shown, target, input.stable_dt);
+            self.pinch = if (target - next).abs() <= 1e-4 { None } else { Some((target, next)) };
+            return pinch_factor(next, shown);
+        }
+        // Ctrl/⌘+wheel and a pinch the system reports as a zoom factor: egui's own easing, or the
+        // whole-step zoom below.
+        if animate {
             self.zoom_pending = 0.0;
             return input.zoom_delta();
         }
@@ -295,6 +344,32 @@ impl CanvasScroll {
         }
         if zoom.is_finite() && zoom > 0.0 { zoom } else { 1.0 }
     }
+}
+
+/// One frame of easing from `shown` towards `target`: 90% of the gap closes in 60 ms. Hostile
+/// frame times leave the scale where it is (and the next frame catches up).
+fn ease_step(shown: f32, target: f32, dt: f32) -> f32 {
+    if !shown.is_finite() || shown <= 0.0 {
+        return 1.0;
+    }
+    if !target.is_finite() || target <= 0.0 {
+        return shown;
+    }
+    if !dt.is_finite() || dt <= 0.0 {
+        return shown;
+    }
+    let a = egui::emath::exponential_smooth_factor(0.9, 0.06, dt.clamp(0.0, MAX_DT));
+    shown + (target - shown) * a
+}
+
+/// The zoom factor to apply for a pinch whose shown scale went from `shown` to `next`; junk never
+/// comes out as a factor.
+fn pinch_factor(next: f32, shown: f32) -> f32 {
+    if !next.is_finite() || !shown.is_finite() || shown <= 0.0 {
+        return 1.0;
+    }
+    let factor = next / shown;
+    if factor.is_finite() && factor > 0.0 { factor } else { 1.0 }
 }
 
 /// Shift scrolls sideways and Alt scrolls vertically, like egui's own scroll areas.
@@ -558,6 +633,149 @@ mod tests {
         for junk in [Event::Zoom(f32::NAN), Event::Zoom(0.0), wheel(MouseWheelUnit::Page, Vec2::new(0.0, f32::INFINITY), Modifiers::COMMAND)] {
             assert_eq!(egui_frame(&ctx, &mut n, false, vec![junk]).1, 1.0);
         }
+    }
+
+    const TOUCH_DEVICE: egui::TouchDeviceId = egui::TouchDeviceId(0);
+
+    /// One finger going down, moving or lifting at `(x, y)`.
+    fn finger(id: u64, phase: TouchPhase, x: f32, y: f32) -> Event {
+        Event::Touch { device_id: TOUCH_DEVICE, id: egui::TouchId(id), phase, pos: egui::pos2(x, y), force: None }
+    }
+
+    /// One frame with `events`, returning both the frame's scroll and its zoom factor. The pointer
+    /// sits at the gesture's centre, as a touch screen reports it (egui only starts a gesture when
+    /// it knows where the pointer is).
+    fn touch_frame(ctx: &egui::Context, scroll: &mut CanvasScroll, t: f64, mut events: Vec<Event>, pointer: egui::Pos2) -> (Vec2, f32) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        events.push(Event::PointerMoved(pointer));
+        let input = egui::RawInput { events, time: Some(t), screen_rect: Some(screen), ..Default::default() };
+        let mut seen = (Vec2::ZERO, 1.0);
+        ctx.run_ui(input, |ui| {
+            let opts = ui.ctx().options(|o| o.input_options);
+            seen = ui.input(|i| (scroll.frame(i, &opts, true, NOTCH_PX, 300.0, true), scroll.zoom(i, &opts, true)));
+        })
+        .drop_without_applying_deltas();
+        seen
+    }
+
+    /// Two fingers on the glass pan the page 1:1, one finger leaves it to the text, and the pan
+    /// coasts after the fingers lift like a touchpad flick.
+    #[test]
+    fn two_finger_pan_moves_the_page_and_coasts() {
+        let ctx = egui::Context::default();
+        let mut scroll = CanvasScroll::default();
+        let mut t = 0.0;
+        let mut next = || {
+            t += f64::from(FRAME);
+            t
+        };
+        // One finger: no pan.
+        touch_frame(&ctx, &mut scroll, next(), vec![finger(1, TouchPhase::Start, 100.0, 100.0)], egui::pos2(100.0, 100.0));
+        let (one, _) = touch_frame(&ctx, &mut scroll, next(), vec![finger(1, TouchPhase::Move, 100.0, 40.0)], egui::pos2(100.0, 40.0));
+        assert_eq!(one, Vec2::ZERO, "one finger selects text; it doesn't scroll");
+        touch_frame(&ctx, &mut scroll, next(), vec![finger(1, TouchPhase::End, 100.0, 40.0)], egui::pos2(100.0, 40.0));
+
+        // Two fingers, both moving up 6 pt a frame: the page follows 1:1.
+        touch_frame(
+            &ctx,
+            &mut scroll,
+            next(),
+            vec![finger(1, TouchPhase::Start, 100.0, 100.0), finger(2, TouchPhase::Start, 140.0, 100.0)],
+            egui::pos2(120.0, 100.0),
+        );
+        let mut panned = Vec2::ZERO;
+        for i in 0..6 {
+            let y = 100.0 - 6.0 * (i as f32 + 1.0);
+            let (d, _) = touch_frame(
+                &ctx,
+                &mut scroll,
+                next(),
+                vec![finger(1, TouchPhase::Move, 100.0, y), finger(2, TouchPhase::Move, 140.0, y)],
+                egui::pos2(120.0, y),
+            );
+            panned += d;
+        }
+        assert!(panned.y < -30.0 && panned.y > -40.0, "the page followed the fingers: {panned:?}");
+
+        // Both lift: where the platform doesn't send its own momentum, the pan coasts on in the
+        // same direction, then settles (macOS, Windows and the web send momentum themselves).
+        touch_frame(
+            &ctx,
+            &mut scroll,
+            next(),
+            vec![finger(1, TouchPhase::End, 100.0, 64.0), finger(2, TouchPhase::End, 140.0, 64.0)],
+            egui::pos2(120.0, 64.0),
+        );
+        if SYNTH_MOMENTUM {
+            assert!(scroll.is_animating(), "the pan coasts after the lift");
+            let mut coast = Vec2::ZERO;
+            for _ in 0..5 {
+                let (d, _) = touch_frame(&ctx, &mut scroll, next(), Vec::new(), egui::pos2(120.0, 64.0));
+                coast += d;
+            }
+            assert!(coast.y < -5.0, "the coast carries the fingers' movement: {coast:?}");
+        }
+    }
+
+    /// One frame's zoom alone (`scroll.frame` and `scroll.zoom`, as the canvas runs them).
+    fn zoom_frame(ctx: &egui::Context, scroll: &mut CanvasScroll, t: f64, animate: bool, mut events: Vec<Event>, pointer: egui::Pos2) -> f32 {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        events.push(Event::PointerMoved(pointer));
+        let input = egui::RawInput { events, time: Some(t), screen_rect: Some(screen), ..Default::default() };
+        let zoom = std::cell::Cell::new(1.0_f32);
+        ctx.run_ui(input, |ui| {
+            let opts = ui.ctx().options(|o| o.input_options);
+            let z = ui.input(|i| {
+                let _ = scroll.frame(i, &opts, true, NOTCH_PX, 300.0, animate);
+                scroll.zoom(i, &opts, animate)
+            });
+            zoom.set(z);
+        })
+        .drop_without_applying_deltas();
+        zoom.get()
+    }
+
+    /// A pinch zooms around the point between the fingers. With animation effects on the shown
+    /// scale eases towards the fingers (so a shaky pinch doesn't jitter the page) and the rest
+    /// arrives after they lift; with them off each frame's factor lands at once.
+    #[test]
+    fn pinch_eases_to_the_fingers_then_finishes() {
+        let centre = egui::pos2(100.0, 150.0);
+        let start = || vec![finger(1, TouchPhase::Start, 90.0, 150.0), finger(2, TouchPhase::Start, 110.0, 150.0)];
+        // Fingers 20 pt apart, then 40: a ×2 pinch.
+        let apart = || vec![finger(1, TouchPhase::Move, 80.0, 150.0), finger(2, TouchPhase::Move, 120.0, 150.0)];
+        let lift = || vec![finger(1, TouchPhase::End, 80.0, 150.0), finger(2, TouchPhase::End, 120.0, 150.0)];
+
+        let ctx = egui::Context::default();
+        let mut scroll = CanvasScroll::default();
+        let mut frame = 0.0_f64;
+        let at = |f: &mut f64| {
+            *f += f64::from(FRAME);
+            *f
+        };
+        assert_eq!(zoom_frame(&ctx, &mut scroll, at(&mut frame), true, start(), centre), 1.0);
+        let first = zoom_frame(&ctx, &mut scroll, at(&mut frame), true, apart(), centre);
+        assert!(first > 1.0 && first < 2.0, "eased, not jumped: {first}");
+        let mut total = first;
+        // Fingers rest at the same spread; the shown scale catches up to them.
+        while scroll.is_animating() && frame < 200.0 {
+            total *= zoom_frame(&ctx, &mut scroll, at(&mut frame), true, apart(), centre);
+        }
+        // Lift: any last part still arrives.
+        total *= zoom_frame(&ctx, &mut scroll, at(&mut frame), true, lift(), centre);
+        while scroll.is_animating() && frame < 400.0 {
+            total *= zoom_frame(&ctx, &mut scroll, at(&mut frame), true, Vec::new(), centre);
+        }
+        assert!(!scroll.is_animating(), "the pinch settles");
+        assert!((total - 2.0).abs() < 0.05, "the whole pinch arrived: ×{total}");
+
+        // Without animation: the first frame is the fingers' own factor and nothing follows.
+        let mut scroll = CanvasScroll::default();
+        let mut frame = 0.0_f64;
+        assert_eq!(zoom_frame(&ctx, &mut scroll, at(&mut frame), false, start(), centre), 1.0);
+        let zoom = zoom_frame(&ctx, &mut scroll, at(&mut frame), false, apart(), centre);
+        assert!((zoom - 2.0).abs() < 1e-4, "each frame's factor at once: ×{zoom}");
+        assert!(!scroll.is_animating(), "nothing left to ease");
     }
 
     #[test]

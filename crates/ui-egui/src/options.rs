@@ -204,6 +204,14 @@ fn general(app: &mut WordApp, ui: &mut Ui) {
     {
         let _ = app.run("ui.startScreen", json!({"value": start}));
     }
+    ui.add_space(6.0);
+    if ui
+        .button(tl!("Show the welcome tour again"))
+        .on_hover_text(tl!("The five short pages about storage, appearance, editing and the Start screen."))
+        .clicked()
+    {
+        let _ = app.run("ui.onboarding", json!({"value": true}));
+    }
     ui.add_space(8.0);
     section(ui, "Personalize");
     egui::Grid::new("options_user").num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
