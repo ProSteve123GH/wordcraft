@@ -1,6 +1,6 @@
 # WordCraft on Android — port plan
 
-**Status:** Phase 0 complete; Phase 1 implemented (APK builds and device checks pending).
+**Status:** Phase 1 implemented; both APK ABIs build and verify in CI; device verification pending.
 **This is a fork addition.** Upstream WordCraft targets macOS, Windows, Linux, the BSDs and the web;
 the Android port lives in `apps/wordcraft-android/` and keeps the desktop, web and CLI builds intact.
 
@@ -186,9 +186,16 @@ which newer build-tools no longer ship) and exposes a private SDK view containin
 34 so ndk-build does not select a newer one. APKs are signed with a throwaway CI key generated in
 `$RUNNER_TEMP`; nothing is committed.
 
+**CI evidence (2026-11-06):** [Android run 42244008938](https://github.com/ProSteve123GH/wordcraft/actions/runs/42244008938)
+built both APKs. `aapt2 dump badging` reported package `ai.storyteller.wordcraft`, `sdkVersion 26`,
+`targetSdkVersion 34`, label `WordCraft` and the expected `native-code` for each ABI;
+`apksigner verify` accepted v2/v3 signatures. The upstream [CI gate 42244009696](https://github.com/ProSteve123GH/wordcraft/actions/runs/42244009696)
+also passed, so the host workspace, formatting, clippy, tests, assets and layering checks stay green.
+
 ## Revision history
 
 | Date | Change |
 |---|---|
 | 2026-11-06 | Phase 0 inspection and plan written. |
 | 2026-11-06 | Phase 1 implementation: crate, shell, theme, logging, fonts, layering, workflow and README added. cargo-apk pinned to 0.10.0 so the `[lib] name = "wordcraft"` artifact is found. |
+| 2026-11-06 | CI: both ABIs built, badging and v2/v3 signatures verified; upstream CI gate green. Device verification remains. |
