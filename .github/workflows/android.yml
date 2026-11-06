@@ -178,7 +178,7 @@ jobs:
       - name: Build ${{ matrix.abi }}
         run: |
           set -euo pipefail
-          cargo apk build --release --locked --target "${{ matrix.target }}" -p wordcraft-android
+          cargo apk build --release --target "${{ matrix.target }}" -p wordcraft-android
           APK="$(find target -type f -name 'wordcraft.apk' -path '*/apk/*' | head -n 1)"
           if [ -z "$APK" ]; then
             echo "cargo-apk did not produce wordcraft.apk" >&2
