@@ -234,6 +234,10 @@ pub fn system_font_dirs() -> Vec<std::path::PathBuf> {
         if let Some(l) = std::env::var_os("LOCALAPPDATA") {
             dirs.push(std::path::PathBuf::from(l).join("Microsoft\\Windows\\Fonts"));
         }
+    } else if cfg!(target_os = "android") {
+        // Android ships its UI and CJK faces here (Noto, Droid). The bundled OFL faces still
+        // guarantee text on a device whose system folder cannot be read.
+        dirs.push("/system/fonts".into());
     } else {
         dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(Into::into));
         if let Some(h) = &home {

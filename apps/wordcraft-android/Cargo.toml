@@ -1,0 +1,66 @@
+[package]
+name = "wordcraft-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "WordCraft on Android: the real engine and egui shell on winit's NativeActivity backend"
+
+# cargo-apk turns this cdylib into the APK's lib/<abi>/libwordcraft.so. The artifact name is what
+# the injected `android.app.lib_name` meta-data points at, so it must stay `wordcraft` (`-` → `_`).
+# A mismatch gives an APK that installs and then dies on launch.
+[lib]
+name = "wordcraft"
+crate-type = ["cdylib"]
+
+# Deliberately no `[lints] workspace = true`: the `#[unsafe(no_mangle)]` Android entry point trips
+# the workspace's `unsafe_code = "forbid"` lint. No unsafe code is written; the crate still denies
+# the panic lints itself (see `src/lib.rs`).
+[dependencies]
+# The file logger must also compile on the host, where the crate's tests run.
+log = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+wordcraft-engine = { workspace = true }
+wordcraft-fonts = { workspace = true }
+wordcraft-ui-egui = { workspace = true }
+egui = { workspace = true }
+
+# `android-native-activity` is the whole reason this builds: without an Activity backend,
+# `android-activity` is pulled with no backend and eframe fails with "Either game-activity or
+# native-activity must be enabled". `accesskit` is deliberately absent — eframe rejects
+# accesskit + native-activity (AccessKit's Android adapter only supports GameActivity), and
+# WordCraft does not need a screen-reader bridge for the first phase.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "android-native-activity"] }
+
+# Needed to name `AndroidApp` for `NativeOptions::android_app` and the entry point. The version is
+# pinned to the one eframe/egui-winit resolve to; the workspace patch points it at the suite's fork.
+winit = { version = "=0.30.13", default-features = false, features = ["android-native-activity"] }
+
+[package.metadata.android]
+package = "ai.storyteller.wordcraft"
+apk_name = "wordcraft"
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
+strip = "strip"
+resources = "res"
+
+[package.metadata.android.sdk]
+# Android 8.0 is the floor for a modern Vulkan driver surface.
+min_sdk_version = 26
+# 34 keeps the classic window layout: Android 15 only enforces edge-to-edge for target 35+, so the
+# status bar and navigation/gesture bar stay visible and the content sits between them without a
+# Java WindowInsets bridge. Moving to 35+ is a later phase (see docs/ANDROID_PORT_PLAN.md).
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "WordCraft"
+theme = "@style/WordcraftTheme"
+icon = "@mipmap/ic_launcher"
+# Keep the .so uncompressed so the loader can map it from the APK directly.
+extract_native_libs = true
+
+# A recreated NativeActivity destroys the window while the render loop lives on (blank surface).
+# Declare every configuration the app handles itself so rotation, split screen, the IME, density and
+# font-scale changes keep the Activity (and its surface) alive.
+[package.metadata.android.application.activity]
+config_changes = "orientation|keyboardHidden|screenSize|smallestScreenSize|screenLayout|density|uiMode|fontScale|keyboard|navigation|touchscreen"

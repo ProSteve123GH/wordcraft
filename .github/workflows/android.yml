@@ -1,0 +1,217 @@
+name: Android
+
+# Fork-only: builds the native Android APKs (arm64-v8a and armeabi-v7a) with cargo-apk.
+# The desktop/web gate in ci.yml stays the upstream one; this workflow adds the Android targets and
+# only checks the new crate on the host.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/wordcraft-android/**"
+      - "crates/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "ATTRIBUTION.md"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "apps/wordcraft-android/**"
+      - "crates/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "ATTRIBUTION.md"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Host-side checks for the shell crate. The Android code itself is compiled by the APK jobs.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-check
+          cache-targets: false
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Test the shell crate
+        run: cargo test --locked -p wordcraft-android
+
+      - name: Clippy the shell crate
+        run: cargo clippy --locked -p wordcraft-android --all-targets -- -D warnings
+
+      - name: Layering and attribution
+        run: |
+          cargo xtask layers
+          cargo xtask assets
+
+  # One ABI per runner: arm64 first, then armv7. Sequential on purpose (the brief asks for one
+  # build at a time and the ARM32 build is the one likely to expose a dependency problem).
+  apk:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        include:
+          - abi: arm64-v8a
+            target: aarch64-linux-android
+          - abi: armeabi-v7a
+            target: armv7-linux-androideabi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust ${{ matrix.target }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-${{ matrix.target }}
+          # Registry and git checkouts only: a target cache for wgpu/ring is several GB and the
+          # cache budget is better spent on the two sequential ABIs.
+          cache-targets: false
+
+      - name: JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK and NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMGR="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$SDKMGR" ]; then
+            echo "sdkmanager not found under $SDK" >&2
+            exit 1
+          fi
+          yes | "$SDKMGR" --licenses >/dev/null || true
+
+          # cargo-apk 0.9.7 uses legacy aapt, which newer build-tools no longer ship. Pin both the
+          # build-tools and the platform it compiles resources against.
+          if [ ! -d "$SDK/build-tools/34.0.0" ]; then
+            "$SDKMGR" --install "build-tools;34.0.0" >/dev/null
+          fi
+          if [ ! -d "$SDK/platforms/android-34" ]; then
+            "$SDKMGR" --install "platforms;android-34" >/dev/null
+          fi
+
+          # The port is developed against NDK r27.
+          NDK="$(ls -d "$SDK"/ndk/27.* 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -z "$NDK" ]; then
+            "$SDKMGR" --install "ndk;27.2.12479018" >/dev/null
+            NDK="$SDK/ndk/27.2.12479018"
+          fi
+
+          # ndk-build (through cargo-apk) picks the lexicographically highest build-tools version
+          # it can see. Give it a private SDK view containing only 34.0.0 and platform 34.
+          VIEW="$RUNNER_TEMP/android-sdk"
+          mkdir -p "$VIEW/build-tools" "$VIEW/platforms"
+          ln -sfn "$SDK/build-tools/34.0.0" "$VIEW/build-tools/34.0.0"
+          ln -sfn "$SDK/platforms/android-34" "$VIEW/platforms/android-34"
+          {
+            echo "ANDROID_HOME=$VIEW"
+            echo "ANDROID_SDK_ROOT=$VIEW"
+            echo "ANDROID_NDK_HOME=$NDK"
+            echo "ANDROID_NDK_ROOT=$NDK"
+          } >> "$GITHUB_ENV"
+          echo "Using NDK $NDK, build-tools 34.0.0, platform android-34"
+
+      - name: Cache cargo-apk
+        id: cargo-apk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-apk
+          key: cargo-apk-0.9.7-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-apk
+        if: steps.cargo-apk.outputs.cache-hit != 'true'
+        run: cargo install cargo-apk --version 0.9.7 --locked
+
+      - name: Make a throwaway signing key
+        run: |
+          set -euo pipefail
+          PASSWORD="$(openssl rand -hex 24)"
+          keytool -genkeypair -v \
+            -keystore "$RUNNER_TEMP/wordcraft-ci.jks" \
+            -alias wordcraft \
+            -keyalg RSA -keysize 4096 -validity 10000 \
+            -storepass "$PASSWORD" -keypass "$PASSWORD" \
+            -dname "CN=WordCraft CI, OU=CI, O=WordCraft, L=CI, ST=CI, C=US"
+          {
+            echo "CARGO_APK_RELEASE_KEYSTORE=$RUNNER_TEMP/wordcraft-ci.jks"
+            echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=$PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          cargo apk build --release --locked --target "${{ matrix.target }}" -p wordcraft-android
+          APK="$(find target -type f -name 'wordcraft.apk' -path '*/apk/*' | head -n 1)"
+          if [ -z "$APK" ]; then
+            echo "cargo-apk did not produce wordcraft.apk" >&2
+            find target -maxdepth 5 -type f -name '*.apk' >&2 || true
+            exit 1
+          fi
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          ls -lh "$APK"
+
+      - name: Verify ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          AAPT2="$ANDROID_HOME/build-tools/34.0.0/aapt2"
+          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          OUT="$RUNNER_TEMP/verify.txt"
+
+          "$AAPT2" dump badging "$APK" > "$OUT"
+
+          grep -q "package: name='ai.storyteller.wordcraft'" "$OUT"
+          grep -q "sdkVersion:'26'" "$OUT"
+          grep -q "targetSdkVersion:'34'" "$OUT"
+          grep -q "native-code: '${{ matrix.abi }}'" "$OUT"
+          grep -q "application-label:'WordCraft'" "$OUT"
+
+          "$APKSIGNER" verify --verbose --print-certs "$APK" >> "$OUT"
+          echo "--- badging and signature ---"
+          cat "$OUT"
+
+      - name: Upload ${{ matrix.abi }} APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wordcraft-android-${{ matrix.abi }}
+          path: |
+            ${{ env.APK }}
+            ${{ runner.temp }}/verify.txt
+          if-no-files-found: error

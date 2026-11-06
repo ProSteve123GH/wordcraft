@@ -51,6 +51,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("testkit", Class::Testkit),
     // apps and tooling
     ("wordcraft", Class::Exempt),
+    ("android", Class::Exempt),
     ("cli", Class::Exempt),
     ("web", Class::Exempt),
     ("xtask", Class::Exempt),
