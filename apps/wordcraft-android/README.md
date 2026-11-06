@@ -31,12 +31,13 @@ Prerequisites (what the CI workflow installs):
 - Rust with the `aarch64-linux-android` and/or `armv7-linux-androideabi` target;
 - Android SDK with **build-tools 34.0.0**, platform **android-34**, and **NDK r27**;
 - JDK 17 or newer (for `apksigner`);
-- [`cargo-apk`](https://github.com/rust-mobile/cargo-apk) 0.9.7.
+- [`cargo-apk`](https://github.com/rust-mobile/cargo-apk) 0.10.0 (0.9.7 looks for the package
+  name rather than the `[lib]` name, so it cannot build a crate whose library is named `wordcraft`).
 
 ```bash
 export ANDROID_HOME=/path/to/android-sdk
 export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018
-cargo install cargo-apk --version 0.9.7 --locked
+cargo install cargo-apk --version 0.10.0 --locked
 
 # A throwaway key is enough to sideload a test build.
 keytool -genkeypair -v -keystore /tmp/wordcraft-test.jks -alias wordcraft \
@@ -49,7 +50,7 @@ cargo apk build --release --target aarch64-linux-android -p wordcraft-android
 # -> target/release/apk/wordcraft.apk
 ```
 
-`cargo-apk 0.9.7` drives the legacy `aapt`, so use **build-tools 34.0.0**, not a newer build-tools
+`cargo-apk 0.10.0` drives the legacy `aapt`, so use **build-tools 34.0.0**, not a newer build-tools
 release that has dropped it. It also expects NDK r27 (r27 is what the port is tested with).
 
 The APK package id is `ai.storyteller.wordcraft` and the library artifact is `libwordcraft.so`

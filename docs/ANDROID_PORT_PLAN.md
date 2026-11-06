@@ -71,12 +71,13 @@ wordcraft-engine / doc / layout / render (vello_cpu page rasterisation)
 ```
 
 - **New crate** `apps/wordcraft-android`, package `wordcraft-android`, library **`wordcraft`**
-  (`cdylib`). It depends on `wordcraft-engine`, `wordcraft-ui-egui`, `wordcraft-fonts`,
-  `wordcraft-doc`, `egui`, `eframe` (no `accesskit`, `android-native-activity`, `wgpu`) and `winit`
-  (Android backend). No desktop shell crate is reused: `apps/wordcraft` pulls `rfd`, `arboard`,
-  `craft-print`, X11/Wayland/zbus, all of which are desktop-only.
-- **No Java, no Gradle**: `cargo-apk 0.9.7` assembles the manifest, resources, native library and
+  (`cdylib`). It depends on `wordcraft-engine`, `wordcraft-ui-egui`, `wordcraft-fonts`, `log`,
+  `egui`, `eframe` (no `accesskit`, `android-native-activity`, `wgpu`) and `winit` (Android backend).
+  No desktop shell crate is reused: `apps/wordcraft` pulls `rfd`, `arboard`, `craft-print`,
+  X11/Wayland/zbus, all of which are desktop-only.
+- **No Java, no Gradle**: `cargo-apk 0.10.0` assembles the manifest, resources, native library and
   signs the APK with a CI-generated throwaway key. This keeps the local and CI footprint minimal.
+  (0.9.7 cannot be used: it derives the `.so` name from the package name, not the `[lib]` name.)
 - **Window / insets**: `targetSdkVersion = 34`. Android 15 enforces edge-to-edge only for apps
   targeting 35+, so a 34-target app keeps the classic window: the native window is laid out between
   the (visible) status bar and navigation/gesture bar, and the surface size handed to winit already
@@ -128,7 +129,7 @@ Workflow `.github/workflows/android.yml`:
 2. **`apk`** matrix `arm64-v8a` → `armeabi-v7a` with `max-parallel: 1` (sequential, per the brief):
    - Rust stable + both targets; `Swatinem/rust-cache` with `cache-targets: false` (Cargo registry
      and git only; no multi-GB target caches, well under the 10 GB budget);
-   - `cargo-apk 0.9.7` binary cached separately (≈5 MB);
+   - `cargo-apk 0.10.0` binary cached separately (≈5 MB);
    - JDK 21 (apksigner) and NDK r27 from the runner image, installed with `sdkmanager` only if missing;
    - throwaway keystore generated in `$RUNNER_TEMP` (never committed), same store/key password;
    - `cargo apk build --release --target <triple> -p wordcraft-android`;
@@ -180,7 +181,7 @@ These files implement the plan above:
 | `xtask/src/layers.rs` | Registers the `android` app crate as exempt |
 | `.github/workflows/android.yml` | Host checks + sequential arm64/armv7 APK builds, verification and artifacts |
 
-The workflow installs **build-tools 34.0.0** and **NDK r27** (cargo-apk 0.9.7 drives legacy `aapt`,
+The workflow installs **build-tools 34.0.0** and **NDK r27** (cargo-apk 0.10.0 drives legacy `aapt`,
 which newer build-tools no longer ship) and exposes a private SDK view containing only build-tools
 34 so ndk-build does not select a newer one. APKs are signed with a throwaway CI key generated in
 `$RUNNER_TEMP`; nothing is committed.
@@ -190,4 +191,4 @@ which newer build-tools no longer ship) and exposes a private SDK view containin
 | Date | Change |
 |---|---|
 | 2026-11-06 | Phase 0 inspection and plan written. |
-| 2026-11-06 | Phase 1 implementation: crate, shell, theme, logging, fonts, layering, workflow and README added. |
+| 2026-11-06 | Phase 1 implementation: crate, shell, theme, logging, fonts, layering, workflow and README added. cargo-apk pinned to 0.10.0 so the `[lib] name = "wordcraft"` artifact is found. |

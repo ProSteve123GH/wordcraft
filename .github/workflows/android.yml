@@ -119,7 +119,7 @@ jobs:
           fi
           yes | "$SDKMGR" --licenses >/dev/null || true
 
-          # cargo-apk 0.9.7 uses legacy aapt, which newer build-tools no longer ship. Pin both the
+          # cargo-apk 0.10.0 uses legacy aapt, which newer build-tools no longer ship. Pin both the
           # build-tools and the platform it compiles resources against.
           if [ ! -d "$SDK/build-tools/34.0.0" ]; then
             "$SDKMGR" --install "build-tools;34.0.0" >/dev/null
@@ -154,11 +154,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-apk
-          key: cargo-apk-0.9.7-${{ runner.os }}-${{ runner.arch }}
+          key: cargo-apk-0.10.0-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install cargo-apk
         if: steps.cargo-apk.outputs.cache-hit != 'true'
-        run: cargo install cargo-apk --version 0.9.7 --locked
+        run: cargo install cargo-apk --version 0.10.0 --locked
 
       - name: Make a throwaway signing key
         run: |
