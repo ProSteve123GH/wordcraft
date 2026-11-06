@@ -550,8 +550,11 @@ pub fn screen_bar(app: &mut WordApp, ui: &mut Ui, screen: Screen) {
 /// Focus: the ribbon dropped down from the bar, drawn over the page so the page doesn't move. A
 /// click on the page puts it away; Focus stays on.
 pub fn focus_ribbon(app: &mut WordApp, ctx: &egui::Context) {
-    let width = ctx.content_rect().width();
-    egui::Area::new(egui::Id::unique("focus_ribbon")).fixed_pos(pos2(0.0, SCREEN_BAR_HEIGHT)).order(egui::Order::Middle).show(ctx, |ui| {
+    // The safe area starts below the system status bar on mobile; the ribbon drops from the slim
+    // bar, not from the top of the screen.
+    let safe = ctx.content_rect();
+    let width = safe.width();
+    egui::Area::new(egui::Id::unique("focus_ribbon")).fixed_pos(safe.min + vec2(0.0, SCREEN_BAR_HEIGHT)).order(egui::Order::Middle).show(ctx, |ui| {
         ui.set_width(width);
         ui.set_max_width(width);
         crate::ribbon::show(app, ui);
