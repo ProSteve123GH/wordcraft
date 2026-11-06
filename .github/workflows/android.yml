@@ -112,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          SDKMGR="$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          SDKMGR="$(find "$SDK/cmdline-tools" -path '*/bin/sdkmanager' -type f 2>/dev/null | sort -V | tail -n 1 || true)"
           if [ -z "$SDKMGR" ]; then
             echo "sdkmanager not found under $SDK" >&2
             exit 1
@@ -129,7 +129,7 @@ jobs:
           fi
 
           # The port is developed against NDK r27.
-          NDK="$(ls -d "$SDK"/ndk/27.* 2>/dev/null | sort -V | tail -n 1 || true)"
+          NDK="$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d -name '27.*' 2>/dev/null | sort -V | tail -n 1 || true)"
           if [ -z "$NDK" ]; then
             "$SDKMGR" --install "ndk;27.2.12479018" >/dev/null
             NDK="$SDK/ndk/27.2.12479018"
@@ -179,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo apk build --release --target "${{ matrix.target }}" -p wordcraft-android
-          APK="$(find target -type f -name 'wordcraft.apk' -path '*/apk/*' | head -n 1)"
+          APK="$(find target -type f -name 'wordcraft.apk' -path '*/apk/*' -print -quit)"
           if [ -z "$APK" ]; then
             echo "cargo-apk did not produce wordcraft.apk" >&2
             find target -maxdepth 5 -type f -name '*.apk' >&2 || true
