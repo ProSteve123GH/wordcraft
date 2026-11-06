@@ -17,7 +17,9 @@ the BSDs and the web are untouched.
 - A file log at `<internal data>/wordcraft/logs/android.log`.
 - System fonts from `/system/fonts` in addition to the bundled OFL faces.
 - A normal window: status bar and navigation/gesture bar stay visible, and the keyboard resizes the
-  work area (`adjustResize`). No fullscreen, no immersive mode, no transparent system bars.
+  work area (`adjustResize`). No fullscreen, no immersive mode, no transparent system bars. The shell
+  reads the Activity's content rectangle, so the ribbon starts below the status bar and the status
+  bar sits above the gesture bar instead of under it.
 - Both **arm64-v8a** and **armeabi-v7a** APKs, built by GitHub Actions.
 
 Deliberately **not** in Phase 1 (later phases): the Android file picker and Storage Access Framework,
@@ -85,7 +87,9 @@ mismatch (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`).
 adb shell run-as ai.storyteller.wordcraft cat files/wordcraft/logs/android.log
 ```
 
-or, on a development build only, `adb logcat -s wordcraft`.
+or, on a development build only, `adb logcat -s wordcraft`. The log's
+`window content … px; system bars … px` line shows the rectangle Android reported; on the tablet it
+should have a non-zero top inset (status bar) and a non-zero bottom inset (gesture/button bar).
 
 ## Known limitations in Phase 1
 
@@ -94,11 +98,13 @@ or, on a development build only, `adb logcat -s wordcraft`.
   work; opening and saving files do not yet.
 - **No clipboard bridge, printing, autosave or persisted preferences.** Recovery exists, but the
   preference file is not written yet.
-- **Touch is a pointer.** winit's Android backend does not emit `ModifiersChanged`, wheel events or
-  insets; two-finger scrolling, pinch zoom, a modifier-key bridge and a touch-friendly key bar are
-  Phase 3.
-- **`targetSdkVersion 34`.** This keeps the classic inset layout. Moving to 35+ requires a Java
-  `WindowInsets` bridge.
+- **Touch is a pointer.** winit's Android backend does not emit `ModifiersChanged` or wheel events;
+  two-finger scrolling, pinch zoom, a modifier-key bridge and a touch-friendly key bar are Phase 3.
+- **System bar icons stay dark.** The theme requests dark status/navigation icons; WordCraft's dark
+  theme does not restyle the system bars yet (Phase 3).
+- **`targetSdkVersion 34`.** This keeps the classic system-bar colours and behaviour. The shell
+  already handles the window insets itself, so a future move to 35+ needs no Java `WindowInsets`
+  bridge.
 - **English-only build unless optional inputs are present.** CI builds without `CRAFT_I18N_DIR` /
   `CRAFT_FONTS_DIR`; the app runs in English with the bundled fonts.
 - **No automated device test.** CI proves compilation, packaging and signing only.

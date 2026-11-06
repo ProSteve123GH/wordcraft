@@ -13,9 +13,17 @@
 //! Phase 1 keeps the desktop shell's `Services` out: file pickers, clipboard bridges, printing and
 //! settings persistence are Phase 3/4 work. The document engine, editing, layout and rendering are
 //! all live.
+//!
+//! The status bar and the navigation/gesture bar stay visible: the shell reads the Activity's
+//! content rectangle and lays the interface out only inside it (see `insets`).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod logging;
+
+/// The part of the window surface the system bars leave to the app. Compiled on the host too, so
+/// the arithmetic has unit tests.
+#[cfg(any(target_os = "android", test))]
+mod insets;
 
 #[cfg(target_os = "android")]
 mod app;

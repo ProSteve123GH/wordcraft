@@ -3,13 +3,13 @@
   The Activity theme.
 
   No fullscreen and no translucent system bars: the status bar and the navigation/gesture bar stay
-  visible, and the native window (and therefore winit's surface) is laid out between them. The app
-  targets SDK 34 so Android 15 does not force edge-to-edge, which is what keeps the classic insets
-  working without a Java WindowInsets bridge. See docs/ANDROID_PORT_PLAN.md §3.
+  visible. The surface winit receives is the whole window, including their area, so `android_main`'s
+  shell reads the Activity's content rectangle and lays the interface out only inside it. The target
+  stays on SDK 34 so the bars keep classic behaviour and their configured colours. See
+  docs/ANDROID_PORT_PLAN.md §3.
 
-  `windowSoftInputMode` is a themeable attribute even though it is normally set on the Activity:
-  cargo-apk's manifest schema has no field for it, and `adjustResize` is what resizes the surface
-  when the soft keyboard appears instead of letting the keyboard cover the document.
+  `NativeActivity` sets `SOFT_INPUT_ADJUST_RESIZE` itself when it creates the window, so the surface
+  (and therefore the work area) shrinks instead of the keyboard covering the document.
 -->
 <resources>
     <style name="WordcraftTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
@@ -19,6 +19,5 @@
         <item name="android:windowLightStatusBar">true</item>
         <item name="android:windowLightNavigationBar">true</item>
         <item name="android:windowLayoutInDisplayCutoutMode">never</item>
-        <item name="android:windowSoftInputMode">adjustResize</item>
     </style>
 </resources>

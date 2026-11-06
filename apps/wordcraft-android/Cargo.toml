@@ -47,9 +47,10 @@ resources = "res"
 [package.metadata.android.sdk]
 # Android 8.0 is the floor for a modern Vulkan driver surface.
 min_sdk_version = 26
-# 34 keeps the classic window layout: Android 15 only enforces edge-to-edge for target 35+, so the
-# status bar and navigation/gesture bar stay visible and the content sits between them without a
-# Java WindowInsets bridge. Moving to 35+ is a later phase (see docs/ANDROID_PORT_PLAN.md).
+# 34 keeps the classic system-bar behaviour and the theme's bar colours. The shell reads the
+# Activity's content rectangle either way (src/insets.rs), so Android 15's forced edge-to-edge for
+# target 35+ would not put the interface under the bars; moving to 35+ is still a later decision
+# (see docs/ANDROID_PORT_PLAN.md).
 target_sdk_version = 34
 
 [package.metadata.android.application]

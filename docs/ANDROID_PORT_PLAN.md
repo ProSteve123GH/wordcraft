@@ -1,6 +1,8 @@
 # WordCraft on Android — port plan
 
-**Status:** Phase 1 implemented; both APK ABIs build and verify in CI; device verification pending.
+**Status:** Phase 1 implemented; both APK ABIs build and verify in CI. The first device run showed the
+ribbon under the status bar; the shell now applies the Activity's content rectangle (see §3) and the
+fix is awaiting re-test on the tablet.
 **This is a fork addition.** Upstream WordCraft targets macOS, Windows, Linux, the BSDs and the web;
 the Android port lives in `apps/wordcraft-android/` and keeps the desktop, web and CLI builds intact.
 
@@ -30,7 +32,8 @@ the Android port lives in `apps/wordcraft-android/` and keeps the desktop, web a
   it forwards lifecycle (`Resumed`/`Suspended`), touch and key events, but **not** `ModifiersChanged`,
   mouse-wheel/motion events or insets (`MainEvent::InsetsChanged` is a logged TODO). It refuses
   `set_fullscreen` on Android ("Cannot set fullscreen on Android"), so system bars are the theme's
-  business.
+  business. `android-activity` still stores the content rectangle from `onContentRectChanged`
+  (`AndroidApp::content_rect`); winit ignores the event, but the shell reads the stored value.
 - eframe treats Android as non-desktop (`IS_DESKTOP` is false), so `ctx.embed_viewports()` is true.
   WordCraft's `windows_ui` then draws the active window in the root viewport instead of creating a
   second native window — exactly what a single-Activity Android app needs.
@@ -78,12 +81,18 @@ wordcraft-engine / doc / layout / render (vello_cpu page rasterisation)
 - **No Java, no Gradle**: `cargo-apk 0.10.0` assembles the manifest, resources, native library and
   signs the APK with a CI-generated throwaway key. This keeps the local and CI footprint minimal.
   (0.9.7 cannot be used: it derives the `.so` name from the package name, not the `[lib]` name.)
-- **Window / insets**: `targetSdkVersion = 34`. Android 15 enforces edge-to-edge only for apps
-  targeting 35+, so a 34-target app keeps the classic window: the native window is laid out between
-  the (visible) status bar and navigation/gesture bar, and the surface size handed to winit already
-  excludes them. The theme asks for `adjustResize` so the IME resizes the work area. Moving to
-  target 35 needs a Java `WindowInsets` bridge, which belongs with Phase 3/4, not here.
-  No `FLAG_FULLSCREEN`, no immersive mode, no `windowFullscreen`, no transparent system bars.
+- **Window / insets**: `targetSdkVersion = 34`, no `FLAG_FULLSCREEN`, no immersive mode, no
+  `windowFullscreen`, no transparent system bars. The surface winit receives is the **whole** window,
+  including the status bar and navigation/gesture bar area, and Android does not inset the
+  `ANativeWindow` itself (the first tablet run drew the ribbon under the status bar). `NativeActivity`
+  does lay its content view out between the bars and reports the result through
+  `onContentRectChanged`; `android-activity 0.6` stores that in `AndroidApp::content_rect`, while
+  winit 0.30 drops the event. The shell therefore reads the rectangle every frame and
+  (`src/insets.rs`) turns it into egui's `RawInput::safe_area_insets`, then lays the interface out in
+  `Context::content_rect` — `viewport_rect` minus the system bars. This needs no Java `WindowInsets`
+  bridge and also keeps dialogs/tooltips out of the bars. The rectangle is polled for a short while
+  at startup and after a surface resize, because winit does not wake the loop for the change.
+  `NativeActivity` sets `SOFT_INPUT_ADJUST_RESIZE` itself, so the keyboard resizes the work area.
 - **Lifecycle**: `configChanges` keeps the Activity alive across rotation, split screen, IME and
   font-scale changes; winit/eframe recreate the wgpu surface on `Resumed` and pause rendering on
   `Suspended`. The document/session lives in `WordApp`, outside the surface, so pause/resume does not
@@ -162,7 +171,8 @@ packaging and signing.
 - Package id `ai.storyteller.wordcraft` is kept for continuity; a sideloaded APK signed by a different
   key cannot replace the community port's install without uninstalling it first. Changing the id is a
   one-line decision if both should coexist.
-- Whether to move to `targetSdk 35+` (requires a Java insets bridge) and to Play-style release signing.
+- Whether to move to `targetSdk 35+` (the shell already handles insets; only the Play-console
+  requirements and system-bar styling remain) and to Play-style release signing.
 
 ## 8. Phase 1 implementation
 
@@ -172,9 +182,10 @@ These files implement the plan above:
 |---|---|
 | `apps/wordcraft-android/Cargo.toml` | New crate (`cdylib` named `wordcraft`), cargo-apk manifest, SDK 26/34, both ABIs, full `configChanges`, no workspace lints (the entry point needs `#[unsafe(no_mangle)]`) |
 | `apps/wordcraft-android/src/lib.rs` | `android_main(app)` entry point, panic lints |
-| `apps/wordcraft-android/src/app.rs` | eframe shell, session, system region, user fonts, recovery, `WordApp` |
+| `apps/wordcraft-android/src/app.rs` | eframe shell, session, system region, user fonts, recovery, `WordApp`, safe-area insets |
+| `apps/wordcraft-android/src/insets.rs` | Content-rectangle → system-bar insets arithmetic, host-tested |
 | `apps/wordcraft-android/src/logging.rs` | Dependency-free file logger with host tests |
-| `apps/wordcraft-android/res/values/styles.xml` | Visible light system bars, `adjustResize`, no fullscreen/immersive |
+| `apps/wordcraft-android/res/values/styles.xml` | Visible light system bars, no fullscreen/immersive |
 | `apps/wordcraft-android/res/mipmap-xxxhdpi/ic_launcher.png` | Launcher icon (copy of the original 512 px app icon, row in `ATTRIBUTION.md`) |
 | `apps/wordcraft-android/README.md` | Build, install and device checklist |
 | `crates/fonts/src/fontdb/names.rs` | `/system/fonts` on Android |
@@ -199,3 +210,4 @@ also passed, so the host workspace, formatting, clippy, tests, assets and layeri
 | 2026-11-06 | Phase 0 inspection and plan written. |
 | 2026-11-06 | Phase 1 implementation: crate, shell, theme, logging, fonts, layering, workflow and README added. cargo-apk pinned to 0.10.0 so the `[lib] name = "wordcraft"` artifact is found. |
 | 2026-11-06 | CI: both ABIs built, badging and v2/v3 signatures verified; upstream CI gate green. Device verification remains. |
+| 2026-11-07 | First device run: ribbon drawn under the status bar. Root cause: `ANativeWindow` is the whole window, not the content area, and winit ignores `ContentRectChanged`. Fix: read `AndroidApp::content_rect`, set egui's safe area and lay out inside `Context::content_rect`; host tests for the inset arithmetic; theme comment corrected (`NativeActivity` sets `adjustResize`). |
