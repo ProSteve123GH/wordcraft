@@ -41,7 +41,7 @@ pub fn init(data_dir: Option<&Path>) -> Option<PathBuf> {
         eprintln!("wordcraft: logger was already installed");
         return None;
     }
-    let Some(logger) = LOGGER.get() else { return None };
+    let logger = LOGGER.get()?;
     if let Err(e) = log::set_logger(logger) {
         eprintln!("wordcraft: cannot install logger: {e}");
         return None;
