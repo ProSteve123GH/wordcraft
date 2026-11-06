@@ -38,10 +38,10 @@ impl ContentRect {
             return None;
         }
         Some(Insets {
-            left: rect.left.max(0).min(width),
-            top: rect.top.max(0).min(height),
-            right: width.saturating_sub(rect.right).max(0).min(width),
-            bottom: height.saturating_sub(rect.bottom).max(0).min(height),
+            left: rect.left.clamp(0, width),
+            top: rect.top.clamp(0, height),
+            right: width.saturating_sub(rect.right).clamp(0, width),
+            bottom: height.saturating_sub(rect.bottom).clamp(0, height),
         })
     }
 }
