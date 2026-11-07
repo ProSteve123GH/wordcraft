@@ -302,10 +302,14 @@ impl eframe::App for Shell {
             self.sticky = egui::Modifiers::NONE;
         }
 
-        // Java reports the real `WindowInsets` from `onApplyWindowInsets`. Prefer them: on
-        // devices that lay the native surface out edge to edge (Android 15's forced edge-to-edge
-        // for target 35+, and several OEM themes) the content rectangle is the whole window and
-        // would put the ribbon under the status bar.
+        self.apply_safe_area(raw_input, density);
+    }
+
+    /// Java reports the real `WindowInsets` from `onApplyWindowInsets`. Prefer them: on devices
+    /// that lay the native surface out edge to edge (Android 15's forced edge-to-edge for target
+    /// 35+, and several OEM themes) the content rectangle is the whole window and would put the
+    /// ribbon under the status bar. Until Java reports real insets, fall back to `content_rect`.
+    fn apply_safe_area(&mut self, raw_input: &mut egui::RawInput, density: f32) {
         if let Some(java) = input::window_insets() {
             let left = java.left as f32 / density;
             let right = java.right as f32 / density;

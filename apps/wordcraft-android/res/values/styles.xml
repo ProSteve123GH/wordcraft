@@ -3,13 +3,14 @@
   The Activity theme.
 
   No fullscreen and no translucent system bars: the status bar and the navigation/gesture bar stay
-  visible. The surface winit receives is the whole window, including their area, so `android_main`'s
-  shell reads the Activity's content rectangle and lays the interface out only inside it. The target
-  stays on SDK 34 so the bars keep classic behaviour and their configured colours. See
-  docs/ANDROID_PORT_PLAN.md §3.
+  visible. The surface winit receives can include their area, so `android_main`'s shell reads the
+  Java `WindowInsets` (falling back to the Activity's content rectangle) and lays the interface out
+  only inside it. The target stays on SDK 34 so the bars keep classic behaviour and their configured
+  colours. See docs/ANDROID_PORT_PLAN.md §3.
 
-  `NativeActivity` sets `SOFT_INPUT_ADJUST_RESIZE` itself when it creates the window, so the surface
-  (and therefore the work area) shrinks instead of the keyboard covering the document.
+  `NativeActivity` sets `SOFT_INPUT_ADJUST_RESIZE`; the shell also treats the IME inset as part of
+  the safe area, so the work area shrinks rather than the keyboard covering the document on devices
+  that do not resize the native surface.
 -->
 <resources>
     <style name="WordcraftTheme" parent="@android:style/Theme.Material.Light.NoActionBar">

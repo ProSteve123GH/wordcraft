@@ -104,6 +104,8 @@ impl Bounds {
         Point::new((self.min.x + self.max.x) * 0.5, (self.min.y + self.max.y) * 0.5)
     }
 
+    // A clamp would panic if a directly constructed `Bounds` ever had min > max; this order cannot.
+    #[allow(clippy::manual_clamp)]
     fn clamp(self, point: Point) -> Point {
         let x = if point.x.is_finite() { point.x } else { self.min.x };
         let y = if point.y.is_finite() { point.y } else { self.min.y };
@@ -224,6 +226,23 @@ struct TwoState {
 struct ThreeState {
     start_centroid: Point,
     toggled: bool,
+}
+
+/// The zoom factor between two finger spreads, if it is large enough to be a real gesture. A zero
+/// or non-finite spread (fingers on top of each other) is ignored rather than dividing.
+fn pinch_factor(from: f32, to: f32) -> Option<f32> {
+    if from <= 1.0 || to <= 1.0 {
+        return None;
+    }
+    let factor = to / from;
+    if factor.is_finite() && factor > 0.0 && (factor - 1.0).abs() > 0.005 { Some(factor.clamp(0.5, 2.0)) } else { None }
+}
+
+/// Two fingers moving by `delta` scroll the page the other way, as a touchpad does.
+fn scroll_by(delta: Point, out: &mut Vec<Action>) {
+    if delta.length() > 0.0 {
+        out.push(Action::Scroll { delta: Point::new(-delta.x, -delta.y), phase: ScrollPhase::Move });
+    }
 }
 
 /// The gesture recogniser. Feed it every touch event in order, call [`Self::tick`] once a frame,
@@ -377,92 +396,106 @@ impl Touchpad {
         };
 
         match self.mode {
-            Mode::One if self.touches.len() == 1 => {
-                // A double tap followed by movement, or a long press followed by movement, is a
-                // text-selection drag. Press before moving so the press lands where the pointer is
-                // now, then move the pointer under the finger.
-                if self.drag.is_none() && moved > TAP_SLOP && (self.drag_armed || self.long_press) {
-                    let button = Button::Left;
-                    out.push(Action::Press { button, pos: self.pointer });
-                    self.drag = Some(button);
-                }
-                let delta = pos - previous;
-                if delta.length() > 0.0 {
-                    self.pointer = self.bounds.clamp(self.pointer + delta.scale(POINTER_GAIN));
-                    out.push(Action::MovePointer { pos: self.pointer });
-                }
-            }
-            Mode::Two => {
-                let (centroid, spread) = self.centroid_spread();
-                if let Some(two) = self.two.as_mut() {
-                    match two.mode {
-                        TwoMode::Undecided => {
-                            let travel = centroid.distance(two.start_centroid);
-                            let spread_change = (spread - two.start_spread).abs();
-                            let both_moved = self.touches.values().all(|touch| touch.moved >= CLASSIFY_BOTH);
-                            let waited = sample.time - two.started >= CLASSIFY_DELAY_SECS;
-                            if two.start_spread > 1.0 && spread_change > PINCH_SLOP && (both_moved || waited) {
-                                two.mode = TwoMode::Pinch;
-                                two.last_spread = spread;
-                                two.last_centroid = centroid;
-                                self.pointer = self.bounds.clamp(centroid);
-                                out.push(Action::MovePointer { pos: self.pointer });
-                                if spread > 1.0 && two.start_spread > 1.0 {
-                                    let factor = spread / two.start_spread;
-                                    if factor.is_finite() && factor > 0.0 && (factor - 1.0).abs() > 0.005 {
-                                        out.push(Action::Zoom { factor: factor.clamp(0.5, 2.0) });
-                                    }
-                                }
-                            } else if travel > SCROLL_SLOP && (both_moved || waited) {
-                                two.mode = TwoMode::Scroll;
-                                let delta = centroid - two.start_centroid;
-                                two.last_centroid = centroid;
-                                self.pointer = self.bounds.clamp(centroid);
-                                out.push(Action::MovePointer { pos: self.pointer });
-                                if delta.length() > 0.0 {
-                                    out.push(Action::Scroll { delta: Point::new(-delta.x, -delta.y), phase: ScrollPhase::Move });
-                                }
-                            }
-                        }
-                        TwoMode::Scroll => {
-                            let delta = centroid - two.last_centroid;
-                            two.last_centroid = centroid;
-                            self.pointer = self.bounds.clamp(centroid);
-                            out.push(Action::MovePointer { pos: self.pointer });
-                            if delta.length() > 0.0 {
-                                out.push(Action::Scroll { delta: Point::new(-delta.x, -delta.y), phase: ScrollPhase::Move });
-                            }
-                        }
-                        TwoMode::Pinch => {
-                            if two.last_spread > 1.0 && spread > 1.0 {
-                                let factor = spread / two.last_spread;
-                                if factor.is_finite() && factor > 0.0 && (factor - 1.0).abs() > 0.005 {
-                                    out.push(Action::Zoom { factor: factor.clamp(0.5, 2.0) });
-                                    two.last_spread = spread;
-                                }
-                            }
-                            self.pointer = self.bounds.clamp(centroid);
-                            out.push(Action::MovePointer { pos: self.pointer });
-                        }
-                    }
-                }
-            }
-            Mode::Three => {
-                let (centroid, _) = self.centroid_spread();
-                if let Some(three) = self.three.as_mut() {
-                    if !three.toggled {
-                        let total = centroid - three.start_centroid;
-                        if total.y > SWIPE_DOWN && total.y.abs() > total.x.abs() * 1.5 {
-                            three.toggled = true;
-                            out.push(Action::ToggleKeyBar);
-                        }
-                    }
-                }
-            }
+            Mode::One if self.touches.len() == 1 => self.moved_one(previous, pos, moved, &mut out),
+            Mode::Two => self.moved_two(sample.time, &mut out),
+            Mode::Three => self.moved_three(&mut out),
             // `Cancel` clears everything; a move without a known touch id is stale.
             Mode::Idle | Mode::Ignore => {}
         }
         out
+    }
+
+    fn moved_one(&mut self, previous: Point, pos: Point, moved: f32, out: &mut Vec<Action>) {
+        // A double tap followed by movement, or a long press followed by movement, is a text
+        // selection drag. Press before moving so the press lands where the pointer is now, then
+        // move the pointer under the finger.
+        if self.drag.is_none() && moved > TAP_SLOP && (self.drag_armed || self.long_press) {
+            let button = Button::Left;
+            out.push(Action::Press { button, pos: self.pointer });
+            self.drag = Some(button);
+        }
+        let delta = pos - previous;
+        if delta.length() > 0.0 {
+            self.pointer = self.bounds.clamp(self.pointer + delta.scale(POINTER_GAIN));
+            out.push(Action::MovePointer { pos: self.pointer });
+        }
+    }
+
+    fn moved_two(&mut self, time: f64, out: &mut Vec<Action>) {
+        let (centroid, spread) = self.centroid_spread();
+        let Some(mode) = self.two.as_ref().map(|two| two.mode) else {
+            return;
+        };
+        match mode {
+            TwoMode::Undecided => self.classify_two(time, centroid, spread, out),
+            TwoMode::Scroll => self.scroll_two(centroid, out),
+            TwoMode::Pinch => self.pinch_two(centroid, spread, out),
+        }
+    }
+
+    fn classify_two(&mut self, time: f64, centroid: Point, spread: f32, out: &mut Vec<Action>) {
+        let Some(two) = self.two.as_mut() else {
+            return;
+        };
+        let travel = centroid.distance(two.start_centroid);
+        let spread_change = (spread - two.start_spread).abs();
+        let both_moved = self.touches.values().all(|touch| touch.moved >= CLASSIFY_BOTH);
+        let waited = time - two.started >= CLASSIFY_DELAY_SECS;
+        let pinch = two.start_spread > 1.0 && spread_change > PINCH_SLOP && (both_moved || waited);
+        if pinch {
+            two.mode = TwoMode::Pinch;
+            two.last_spread = spread;
+            two.last_centroid = centroid;
+            self.pointer = self.bounds.clamp(centroid);
+            out.push(Action::MovePointer { pos: self.pointer });
+            if let Some(factor) = pinch_factor(two.start_spread, spread) {
+                out.push(Action::Zoom { factor });
+            }
+        } else if travel > SCROLL_SLOP && (both_moved || waited) {
+            two.mode = TwoMode::Scroll;
+            two.last_centroid = centroid;
+            self.pointer = self.bounds.clamp(centroid);
+            out.push(Action::MovePointer { pos: self.pointer });
+            scroll_by(centroid - two.start_centroid, out);
+        }
+    }
+
+    fn scroll_two(&mut self, centroid: Point, out: &mut Vec<Action>) {
+        let Some(two) = self.two.as_mut() else {
+            return;
+        };
+        let delta = centroid - two.last_centroid;
+        two.last_centroid = centroid;
+        self.pointer = self.bounds.clamp(centroid);
+        out.push(Action::MovePointer { pos: self.pointer });
+        scroll_by(delta, out);
+    }
+
+    fn pinch_two(&mut self, centroid: Point, spread: f32, out: &mut Vec<Action>) {
+        let Some(two) = self.two.as_mut() else {
+            return;
+        };
+        if let Some(factor) = pinch_factor(two.last_spread, spread) {
+            two.last_spread = spread;
+            out.push(Action::Zoom { factor });
+        }
+        self.pointer = self.bounds.clamp(centroid);
+        out.push(Action::MovePointer { pos: self.pointer });
+    }
+
+    fn moved_three(&mut self, out: &mut Vec<Action>) {
+        let (centroid, _) = self.centroid_spread();
+        let Some(three) = self.three.as_mut() else {
+            return;
+        };
+        if three.toggled {
+            return;
+        }
+        let total = centroid - three.start_centroid;
+        if total.y > SWIPE_DOWN && total.y.abs() > total.x.abs() * 1.5 {
+            three.toggled = true;
+            out.push(Action::ToggleKeyBar);
+        }
     }
 
     fn end(&mut self, sample: TouchSample) -> Vec<Action> {

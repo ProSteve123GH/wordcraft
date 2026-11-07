@@ -22,12 +22,14 @@ the BSDs and the web are untouched.
   by winit's Android backend, so a physical mouse cannot yet drive the page pointer (see the
   limitations).
 - **Extra key bar:** Ctrl, Alt, Shift (sticky), Esc, Tab, arrows, Home, End, Page Up and Page Down,
-  drawn above the status bar and resized by the keyboard.
+  drawn at the bottom of the safe area, above the system navigation/gesture bar, and resized by the
+  keyboard.
 - **Back and IME:** with the keyboard visible, Back hides it; with a text editor still focused but
   the keyboard hidden, Back brings it back; elsewhere Back follows Android's normal behaviour.
 - **Window insets from `WindowInsets`, not only the content rectangle.** Java reports status-bar,
-  cutout and navigation/gesture-bar insets; the shell uses them as egui's safe area and falls back to
-  the old content rectangle only before Java has reported. Both system bars stay visible.
+  cutout, navigation/gesture-bar and IME insets; the shell uses them as egui's safe area and falls
+  back to the old content rectangle only before Java has reported. Both system bars stay visible and
+  the keyboard shrinks the work area.
 - **GPU selection:** wgpu is asked for both **Vulkan** and **OpenGL ES** adapters, a hardware Vulkan
   adapter is preferred, hardware OpenGL ES is the fallback, and a software rasteriser is refused
   unless a diagnostic variable says otherwise. The requested backends, every candidate adapter
