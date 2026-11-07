@@ -1,9 +1,11 @@
 # WordCraft on Android — port plan
 
-**Status:** Phases 1 and 2 implemented; both APK ABIs build and verify in CI. The first device run
-showed the ribbon under the status bar; the shell now applies the Activity's content rectangle (see
-§3) and the fix is awaiting re-test on the tablet. Phase 2 adds runtime Vulkan/OpenGL ES adapter
-selection and an opt-in frame-time benchmark (§9); Phase 3 (input/IME/Back) is next.
+**Status:** Phases 1–3 implemented; both APK ABIs build and verify in CI. The first device run
+showed the ribbon under the status bar; §3 and §10 now apply Java `WindowInsets` (with the Activity's
+content rectangle as the startup fallback), and the fix still needs re-testing on the tablet. Phase 2
+added runtime Vulkan/OpenGL ES adapter selection and an opt-in frame-time benchmark (§9); Phase 3
+added the touchpad gestures, extra key bar, Back/IME handling and physical-device reporting (§10).
+Phase 4 (files, autosave, settings) is deliberately not started.
 **This is a fork addition.** Upstream WordCraft targets macOS, Windows, Linux, the BSDs and the web;
 the Android port lives in `apps/wordcraft-android/` and keeps the desktop, web and CLI builds intact.
 
@@ -331,3 +333,4 @@ is intentionally not started.
 | 2026-11-07 | First device run: ribbon drawn under the status bar. Root cause: `ANativeWindow` is the whole window, not the content area, and winit ignores `ContentRectChanged`. Fix: read `AndroidApp::content_rect`, set egui's safe area and lay out inside `Context::content_rect`; host tests for the inset arithmetic; theme comment corrected (`NativeActivity` sets `adjustResize`). |
 | 2026-11-07 | Phase 2: explicit Vulkan + OpenGL ES instance, surface-compatible hardware adapter selection (software only by diagnostic opt-in), GLES limit clamping, startup renderer logs, opt-in frame-time benchmark with file/env configuration, host tests and README. |
 | 2026-11-07 | Phase 3: Java `MainActivity` bridge (Back/IME including Android 13+ `OnBackInvokedCallback`, device listener, `WindowInsets` including the IME), pure host-tested touchpad gesture recogniser, shell key bar and virtual cursor, physical modifier tracking from winit key events, immediate focus restore for key-bar keys, Java-inset-first safe area, `package-java.sh` + CI dex injection/launchable-Activity/JNI-symbol checks, README and plan updates. A NativeActivity takes the input queue, so Java cannot intercept mouse/key events; winit's Android backend also discards mouse hover/wheel/buttons, recorded as a limitation. |
+| 2026-11-07 | Phase 3 CI fixes: an explicit stale-touch arm for `Mode::One` (guarded arms do not make a match exhaustive), a `match` instead of `if let` so a non-touch event is not moved before it reaches the kept-events list, and the two-finger/inset paths split into small functions to stay under the workspace's cognitive-complexity lint. |

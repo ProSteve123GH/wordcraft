@@ -266,17 +266,18 @@ impl eframe::App for Shell {
         let mut actions = Vec::new();
         let mut touch_started = false;
         for event in pending {
-            if let egui::Event::Touch { id, phase, pos, .. } = event {
-                let phase = match phase {
-                    egui::TouchPhase::Start => touchpad::TouchPhase::Start,
-                    egui::TouchPhase::Move => touchpad::TouchPhase::Move,
-                    egui::TouchPhase::End => touchpad::TouchPhase::End,
-                    egui::TouchPhase::Cancel => touchpad::TouchPhase::Cancel,
-                };
-                touch_started |= phase == touchpad::TouchPhase::Start;
-                actions.extend(self.touchpad.process(touchpad::TouchSample::new(id.0, phase, touchpad::Point::new(pos.x, pos.y), now)));
-            } else {
-                kept.push(event);
+            match event {
+                egui::Event::Touch { id, phase, pos, .. } => {
+                    let phase = match phase {
+                        egui::TouchPhase::Start => touchpad::TouchPhase::Start,
+                        egui::TouchPhase::Move => touchpad::TouchPhase::Move,
+                        egui::TouchPhase::End => touchpad::TouchPhase::End,
+                        egui::TouchPhase::Cancel => touchpad::TouchPhase::Cancel,
+                    };
+                    touch_started |= phase == touchpad::TouchPhase::Start;
+                    actions.extend(self.touchpad.process(touchpad::TouchSample::new(id.0, phase, touchpad::Point::new(pos.x, pos.y), now)));
+                }
+                other => kept.push(other),
             }
         }
         raw_input.events = kept;
@@ -318,7 +319,7 @@ impl eframe::App for Shell {
             let usable = raw_input.screen_rect.is_none_or(|screen| screen.width() - left - right > 1.0 && screen.height() - top - bottom > 1.0);
             // An all-zero report before the first layout is not authoritative; let the content
             // rectangle answer until Java reports real bars.
-            if usable && (java.left + java.top + java.right + java.bottom > 0 || self.java_insets.is_some()) {
+            if usable && (java.left > 0 || java.top > 0 || java.right > 0 || java.bottom > 0 || self.java_insets.is_some()) {
                 if self.java_insets != Some(java) {
                     self.java_insets = Some(java);
                     log::info!(

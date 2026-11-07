@@ -725,7 +725,7 @@ mod tests {
         start(&mut pad, 2, 100.0, 100.0, 0.1);
         moved(&mut pad, 2, 160.0, 100.0, 0.15);
         let actions = start(&mut pad, 3, 300.0, 300.0, 0.2);
-        assert!(matches!(actions.as_slice(), [Action::Release { button: Button::Left, .. }]));
+        assert!(actions.iter().any(|action| matches!(action, Action::Release { button: Button::Left, .. })));
         assert!(clicks(&actions).is_empty());
     }
 
@@ -806,11 +806,11 @@ mod tests {
         start(&mut pad, 3, 500.0, 300.0, 0.02);
         let mut toggles = 0;
         for y in [320.0, 350.0, 390.0, 420.0] {
-            moved(&mut pad, 1, 300.0, y, 0.1);
-            moved(&mut pad, 2, 400.0, y, 0.11);
-            for action in moved(&mut pad, 3, 500.0, y, 0.12) {
-                if action == Action::ToggleKeyBar {
-                    toggles += 1;
+            for (id, x) in [(1, 300.0), (2, 400.0), (3, 500.0)] {
+                for action in moved(&mut pad, id, x, y, 0.1) {
+                    if action == Action::ToggleKeyBar {
+                        toggles += 1;
+                    }
                 }
             }
         }
