@@ -79,7 +79,7 @@ impl BenchConfig {
         };
         let config = parse_config(&text);
         match config {
-            Some(config) => log::info!("bench: using {}", path.display()),
+            Some(_) => log::info!("bench: using {}", path.display()),
             None => log::warn!("bench: {} has no valid `frames=` line; benchmark disabled", path.display()),
         }
         config
@@ -277,7 +277,8 @@ mod tests {
 
     #[test]
     fn percentiles_stay_inside_the_series() {
-        let stats = summarize(&[1, 2]).unwrap_or(Stats { count: 0, min_ms: 0.0, avg_ms: 0.0, p50_ms: 0.0, p95_ms: 0.0, max_ms: 0.0 });
+        // Samples are microseconds: 1000 us = 1.0 ms, 2000 us = 2.0 ms.
+        let stats = summarize(&[1000, 2000]).unwrap_or(Stats { count: 0, min_ms: 0.0, avg_ms: 0.0, p50_ms: 0.0, p95_ms: 0.0, max_ms: 0.0 });
         assert_eq!(stats.p50_ms, 1.0);
         assert_eq!(stats.p95_ms, 2.0);
     }
