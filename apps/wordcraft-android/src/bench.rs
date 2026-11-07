@@ -277,9 +277,10 @@ mod tests {
 
     #[test]
     fn percentiles_stay_inside_the_series() {
-        // Samples are microseconds: 1000 us = 1.0 ms, 2000 us = 2.0 ms.
+        // Samples are microseconds: 1000 us = 1.0 ms, 2000 us = 2.0 ms. With two samples the
+        // nearest-rank p50 is index 1 (the second sample), as documented by `summarize`.
         let stats = summarize(&[1000, 2000]).unwrap_or(Stats { count: 0, min_ms: 0.0, avg_ms: 0.0, p50_ms: 0.0, p95_ms: 0.0, max_ms: 0.0 });
-        assert_eq!(stats.p50_ms, 1.0);
+        assert_eq!(stats.p50_ms, 2.0);
         assert_eq!(stats.p95_ms, 2.0);
     }
 
