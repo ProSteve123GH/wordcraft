@@ -176,6 +176,9 @@ packaging and signing.
   one-line decision if both should coexist.
 - Whether to move to `targetSdk 35+` (the shell already handles insets; only the Play-console
   requirements and system-bar styling remain) and to Play-style release signing.
+- **After Phase 4:** build a release APK (both ABIs), attach them to a GitHub Release from a
+  workflow, and tidy the fork's workflow runs/artifacts. Release signing needs a stable key in
+  repository secrets; the current CI key is throwaway. This is deliberately not part of Phases 1–3.
 
 ## 8. Phase 1 implementation
 
@@ -283,8 +286,9 @@ mouse/trackpad forwarding needs a winit or android-activity patch and is listed 
 **Back and IME.** Java asks `nativeIsEditing`, set each frame from the page canvas's focus or a
 focused egui text box (`canvas.focused || text_edit_focused()`; deliberately not
 `egui_wants_keyboard_input()`, which is also true for a focused button and would stop Back closing a
-dialog). If the IME is accepting text, Back hides it; if an editor is focused but the IME is hidden,
-Back shows it; otherwise Back follows normal Android behaviour. `MainActivity` keeps the
+dialog). If the IME is visible (API 30+; before that, `isAcceptingText`), Back hides it; if an editor is
+focused but the IME is hidden, Back shows it; otherwise Back follows normal Android behaviour.
+`MainActivity` keeps the
 `onBackPressed` override and also registers an `OnBackInvokedCallback` on Android 13+, so Back works
 whether or not predictive back is enabled for the target SDK. The callback finishes the Activity
 directly instead of calling `super.onBackPressed()`, which would re-enter the dispatcher. Show/hide

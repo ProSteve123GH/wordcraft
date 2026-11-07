@@ -306,6 +306,46 @@ impl eframe::App for Shell {
         self.apply_safe_area(raw_input, density);
     }
 
+    /// The real WordCraft interface: ribbon, rulers, page canvas, panes and status bar.
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // eframe's root `Ui` still covers the whole viewport; lay the interface out only in the
+        // part the system bars leave free. Everything WordCraft draws is a panel inside this `Ui`,
+        // so the ribbon starts below the status bar and the status bar above the gesture bar.
+        let safe = ui.ctx().content_rect();
+        let area = ui.max_rect().intersect(safe);
+        if area.width() > 1.0 && area.height() > 1.0 {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                if self.keys_visible {
+                    self.key_bar(ui);
+                }
+                self.app.ui(ui);
+                self.paint_pointer(ui);
+            });
+        } else {
+            // A stale or nonsensical rectangle must never blank the whole interface.
+            self.app.ui(ui);
+        }
+        if let Some(bench) = &mut self.bench {
+            bench.record(frame.info().cpu_usage);
+        }
+    }
+
+    /// The strip under the status bar and around the edges is painted by eframe before egui runs;
+    /// match the window chrome there instead of eframe's dark default.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
+    /// Finishes the recovery copy cleanly when the Activity ends. Android does not guarantee this
+    /// hook, which is why recovery also runs continuously while the Activity is alive.
+    fn on_exit(&mut self) {
+        self.app.session.finish_recovery();
+        log::info!("WordCraft: Activity finished");
+        logging::flush();
+    }
+}
+
+impl Shell {
     /// Java reports the real `WindowInsets` from `onApplyWindowInsets`. Prefer them: on devices
     /// that lay the native surface out edge to edge (Android 15's forced edge-to-edge for target
     /// 35+, and several OEM themes) the content rectangle is the whole window and would put the
@@ -376,46 +416,6 @@ impl eframe::App for Shell {
         raw_input.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, right, top, bottom }));
     }
 
-    /// The real WordCraft interface: ribbon, rulers, page canvas, panes and status bar.
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        // eframe's root `Ui` still covers the whole viewport; lay the interface out only in the
-        // part the system bars leave free. Everything WordCraft draws is a panel inside this `Ui`,
-        // so the ribbon starts below the status bar and the status bar above the gesture bar.
-        let safe = ui.ctx().content_rect();
-        let area = ui.max_rect().intersect(safe);
-        if area.width() > 1.0 && area.height() > 1.0 {
-            ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
-                if self.keys_visible {
-                    self.key_bar(ui);
-                }
-                self.app.ui(ui);
-                self.paint_pointer(ui);
-            });
-        } else {
-            // A stale or nonsensical rectangle must never blank the whole interface.
-            self.app.ui(ui);
-        }
-        if let Some(bench) = &mut self.bench {
-            bench.record(frame.info().cpu_usage);
-        }
-    }
-
-    /// The strip under the status bar and around the edges is painted by eframe before egui runs;
-    /// match the window chrome there instead of eframe's dark default.
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        visuals.panel_fill.to_normalized_gamma_f32()
-    }
-
-    /// Finishes the recovery copy cleanly when the Activity ends. Android does not guarantee this
-    /// hook, which is why recovery also runs continuously while the Activity is alive.
-    fn on_exit(&mut self) {
-        self.app.session.finish_recovery();
-        log::info!("WordCraft: Activity finished");
-        logging::flush();
-    }
-}
-
-impl Shell {
     fn content_bounds(ctx: &egui::Context) -> touchpad::Bounds {
         let rect = ctx.content_rect();
         touchpad::Bounds::new(touchpad::Point::new(rect.min.x, rect.min.y), touchpad::Point::new(rect.max.x, rect.max.y))
@@ -601,7 +601,7 @@ impl Shell {
     fn paint_pointer(&self, ui: &egui::Ui) {
         let point = self.touchpad.pointer();
         let pos = Self::pos(point);
-        let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("android_virtual_pointer"));
+        let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("android_virtual_pointer"));
         let painter = ui.ctx().layer_painter(layer);
         let fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220);
         let ink = egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230);
