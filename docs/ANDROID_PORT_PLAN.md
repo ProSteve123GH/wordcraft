@@ -241,6 +241,86 @@ pure `parse_config`/`summarize` functions are host-tested.
 an in-app backend switcher, and an automated on-device benchmark in CI. The adapter choice and the
 benchmark are manual device checks.
 
+## 10. Phase 3 implementation: touch, physical input, IME, Back and insets
+
+Phase 3 keeps the engine and the desktop UI unchanged. The Android shell grows the platform pieces
+winit's Android backend does not provide, and the touch model is a touchpad rather than a second,
+finger-sized interface, because WordCraft's ribbon, text selection and drag handles assume a pointer.
+
+| Path | What it does |
+|---|---|
+| `apps/wordcraft-android/src/touchpad.rs` | Pure gesture recogniser: one finger pointer/tap/drag, two finger scroll/pinch/right-click, three finger middle-click and key-bar swipe, cancel/ignore states, hostile-coordinate guards. Host tests for every gesture. |
+| `apps/wordcraft-android/src/input.rs` | JNI bridge for edit state, physical-device presence and Java window insets (a dirty flag wakes the shell). Host tests for the state mapping. |
+| `apps/wordcraft-android/java/ai/storyteller/wordcraft/MainActivity.java` | `NativeActivity` subclass: Back/IME, `InputManager` device listener, `WindowInsets` listener. A NativeActivity takes the window input queue, so Java cannot intercept pointer or key events. |
+| `apps/wordcraft-android/src/app.rs` | `raw_input_hook` tracks physical modifier keys from winit key events, turns touch into pointer/scroll/zoom, draws the virtual cursor and the extra key bar, restores editor focus after a key-bar tap, and prefers Java insets over the content rectangle. |
+| `apps/wordcraft-android/package-java.sh` | Compiles and dexes `MainActivity`, injects `classes.dex`, zipaligns and re-signs. cargo-apk builds only Rust; an APK without this step names an Activity that is not in its dex. |
+| `.github/workflows/android.yml` | Host tests, `javac`/`d8` packaging, launchable-Activity check, `classes.dex` check, JNI-symbol check and re-signing for both ABIs. |
+| `apps/wordcraft-android/README.md` | Gesture table, key bar, Back/IME behaviour, inset source and updated device checklist. |
+
+**Gesture policy.** One finger moves a relative pointer (initialised at the first touch), a tap
+clicks, a nearby second tap arms a drag, and movement past the tap slop presses the left button. A
+long press also arms a drag, but the press is deferred until movement, so holding still never selects
+text under the finger. A two-finger gesture cancels a one-finger drag with a release; scrolling never
+presses. Two fingers classify as a pinch when the spread changes and as a scroll when the centroid
+travels. Android delivers the two fingers' moves one after the other, so classification waits until
+both have moved (or ~120 ms), otherwise the first finger of every scroll would look like a pinch.
+A third finger sends the scroll End and switches to the three-finger gesture. Four or more fingers
+enter `Ignore` until every finger lifts, which is what prevents a ghost click. Cancel releases any
+held button and sends the scroll End.
+
+**Physical input.** A `NativeActivity` hands the window's input queue to the native event loop
+(`Window.takeInputQueue`), so Java `dispatchTouchEvent`/`dispatchKeyEvent`/`dispatchGenericMotionEvent`
+overrides never see pointer or key events. winit's Android backend translates only touch and key
+events; it discards mouse hover, wheel and `ACTION_BUTTON_PRESS/RELEASE` (its source marks mouse
+support `TODO`). Java therefore reports only device attach/remove through `InputManager` and the
+shell logs it. Physical keyboard keys arrive through winit; because it sends no `ModifiersChanged`,
+the shell tracks the left/right Shift, Ctrl, Alt and Super key events, decorates every key event and
+ORs the sticky key-bar modifiers in, clearing them after the next pressed key. Full physical
+mouse/trackpad forwarding needs a winit or android-activity patch and is listed as a limitation.
+
+**Back and IME.** Java asks `nativeIsEditing`, set each frame from the page canvas's focus or a
+focused egui text box (`canvas.focused || text_edit_focused()`; deliberately not
+`egui_wants_keyboard_input()`, which is also true for a focused button and would stop Back closing a
+dialog). If the IME is accepting text, Back hides it; if an editor is focused but the IME is hidden,
+Back shows it; otherwise Back follows normal Android behaviour. `MainActivity` keeps the
+`onBackPressed` override and also registers an `OnBackInvokedCallback` on Android 13+, so Back works
+whether or not predictive back is enabled for the target SDK. The callback finishes the Activity
+directly instead of calling `super.onBackPressed()`, which would re-enter the dispatcher. Show/hide
+go through `AndroidApp::show_soft_input`/`hide_soft_input` rather than
+`InputMethodManager.showSoftInput(decorView)`, because the native window is not an `EditText` the
+IME can attach to. The keyboard shrinks the work area two ways: `SOFT_INPUT_ADJUST_RESIZE` resizes
+the window where the platform does so, and the IME inset is part of the safe area where it does
+not, so the document and key bar always move above the keyboard.
+
+**Key bar.** A bottom egui panel drawn by the shell (not by the shared crate): Ctrl/Alt/Shift as
+sticky toggles, then Esc, Tab, arrows, Home, End, PgUp and PgDn. A vertical window bar is not added
+(the bars stay visible); three-finger swipe down toggles the key bar to reclaim height. A key-bar
+click makes the page canvas or `TextEdit` surrender focus, so the shell remembers the focused editor
+and restores it (and the canvas's `focused` flag) immediately, before the canvas draws later in the
+same pass, so the IME is not asked to hide for one frame; `raw_input_hook` repeats the restore on the
+next frame as a safety net and injects the key. Only editor focus is remembered, not a key-bar button.
+
+**Insets.** Java's `OnApplyWindowInsetsListener` reports
+`WindowInsets.Type.systemBars() | displayCutout() | ime()` (or the pre-30 `getSystemWindowInset*`
+values) in physical pixels. The IME is included because NativeActivity lays the surface out edge to
+edge and Android 11+ does not reliably resize the window for the keyboard; the shell makes room
+itself. The shell prefers this over `AndroidApp::content_rect`, because on edge-to-edge devices the
+content rectangle can be the whole window; `content_rect` remains the fallback until Java has
+reported real insets. An inset-only change does not produce a winit event, so the native side sets a
+dirty flag and the shell schedules a few frames after it.
+
+**Packaging.** cargo-apk only builds Rust and signs the resulting APK. `package-java.sh` compiles
+`MainActivity.java` against platform 34, dexes it with `d8` (`min-api 26`), adds `classes.dex`,
+removes the old v1 signature files, zipaligns and re-signs with the same throwaway keystore. CI checks
+`aapt2 dump badging` for the launchable Activity, `unzip -l` for `classes.dex`, and `llvm-nm` for all
+five JNI exports, so a missing symbol fails the build instead of crashing on the tablet.
+
+**Not done in Phase 3:** physical mouse/trackpad hover, wheel and extra-button forwarding (needs a
+winit/android-activity patch; winit discards those events), direct touch-to-position (deliberately,
+see the README), stylus pressure/tilt and handwriting, a file picker, clipboard bridge, printing,
+autosave/settings, an on-device automated gesture test, and an in-app key-bar layout editor. Phase 4
+is intentionally not started.
+
 ## Revision history
 
 | Date | Change |
@@ -250,3 +330,4 @@ benchmark are manual device checks.
 | 2026-11-06 | CI: both ABIs built, badging and v2/v3 signatures verified; upstream CI gate green. Device verification remains. |
 | 2026-11-07 | First device run: ribbon drawn under the status bar. Root cause: `ANativeWindow` is the whole window, not the content area, and winit ignores `ContentRectChanged`. Fix: read `AndroidApp::content_rect`, set egui's safe area and lay out inside `Context::content_rect`; host tests for the inset arithmetic; theme comment corrected (`NativeActivity` sets `adjustResize`). |
 | 2026-11-07 | Phase 2: explicit Vulkan + OpenGL ES instance, surface-compatible hardware adapter selection (software only by diagnostic opt-in), GLES limit clamping, startup renderer logs, opt-in frame-time benchmark with file/env configuration, host tests and README. |
+| 2026-11-07 | Phase 3: Java `MainActivity` bridge (Back/IME including Android 13+ `OnBackInvokedCallback`, device listener, `WindowInsets` including the IME), pure host-tested touchpad gesture recogniser, shell key bar and virtual cursor, physical modifier tracking from winit key events, immediate focus restore for key-bar keys, Java-inset-first safe area, `package-java.sh` + CI dex injection/launchable-Activity/JNI-symbol checks, README and plan updates. A NativeActivity takes the input queue, so Java cannot intercept mouse/key events; winit's Android backend also discards mouse hover/wheel/buttons, recorded as a limitation. |

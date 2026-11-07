@@ -47,16 +47,19 @@ resources = "res"
 [package.metadata.android.sdk]
 # Android 8.0 is the floor for a modern Vulkan driver surface.
 min_sdk_version = 26
-# 34 keeps the classic system-bar behaviour and the theme's bar colours. The shell reads the
-# Activity's content rectangle either way (src/insets.rs), so Android 15's forced edge-to-edge for
-# target 35+ would not put the interface under the bars; moving to 35+ is still a later decision
-# (see docs/ANDROID_PORT_PLAN.md).
+# 34 keeps the classic system-bar behaviour and the theme's bar colours. The shell reads Java's
+# WindowInsets (falling back to the Activity's content rectangle, src/insets.rs), so Android 15's
+# forced edge-to-edge for target 35+ would not put the interface under the bars; moving to 35+ is
+# still a later decision (see docs/ANDROID_PORT_PLAN.md).
 target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "WordCraft"
 theme = "@style/WordcraftTheme"
 icon = "@mipmap/ic_launcher"
+# MainActivity lives in classes.dex, which package-java.sh injects after cargo-apk has built the
+# APK. Without this attribute Android ignores classes.dex and cannot find the Activity.
+has_code = true
 # Keep the .so uncompressed so the loader can map it from the APK directly.
 extract_native_libs = true
 
@@ -64,4 +67,8 @@ extract_native_libs = true
 # Declare every configuration the app handles itself so rotation, split screen, the IME, density and
 # font-scale changes keep the Activity (and its surface) alive.
 [package.metadata.android.application.activity]
+# A Java subclass of NativeActivity supplies Back/IME handling, the device listener and the
+# window-inset listener (java/ai/storyteller/wordcraft/MainActivity.java). cargo-apk still adds the
+# `android.app.lib_name` meta-data, which is what loads libwordcraft.so.
+name = "ai.storyteller.wordcraft.MainActivity"
 config_changes = "orientation|keyboardHidden|screenSize|smallestScreenSize|screenLayout|density|uiMode|fontScale|keyboard|navigation|touchscreen"

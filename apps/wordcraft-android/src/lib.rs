@@ -10,12 +10,15 @@
 //! keyboard resize the window instead of recreating the Activity (which would destroy the surface
 //! under the running render loop).
 //!
-//! Phase 1 keeps the desktop shell's `Services` out: file pickers, clipboard bridges, printing and
-//! settings persistence are Phase 3/4 work. The document engine, editing, layout and rendering are
-//! all live.
+//! The shell keeps the desktop shell's `Services` out: file pickers, clipboard bridges, printing and
+//! settings persistence are Phase 4 work. The document engine, editing, layout and rendering are all
+//! live.
 //!
-//! The status bar and the navigation/gesture bar stay visible: the shell reads the Activity's
-//! content rectangle and lays the interface out only inside it (see `insets`).
+//! The status bar and the navigation/gesture bar stay visible: the shell lays the interface out only
+//! inside the safe area from Java's `WindowInsets`, falling back to the Activity's content rectangle
+//! (see `insets`). Touch is translated to a virtual pointer, scroll and zoom by `touchpad`, and
+//! `MainActivity` reports device changes, Back and the IME (see `input`); keyboard and touch events
+//! reach the shell through winit.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod logging;
@@ -34,6 +37,15 @@ mod gpu;
 #[cfg(any(target_os = "android", test))]
 mod bench;
 
+/// The touchpad gesture recogniser: one finger is a pointer, two scroll/pinch/right-click, three
+/// tap/ swipe. Pure state, so the whole gesture model is host-tested.
+#[cfg(any(target_os = "android", test))]
+mod touchpad;
+
+/// The Java `MainActivity` bridge: device changes, Back, IME and window insets.
+#[cfg(any(target_os = "android", test))]
+mod input;
+
 #[cfg(target_os = "android")]
 mod app;
 
@@ -42,8 +54,9 @@ use winit::platform::android::activity::AndroidApp;
 
 /// The Android application entry point, called by `android-activity`'s `NativeActivity` glue.
 ///
-/// `unsafe(no_mangle)` is required because the Java side looks the symbol up by name; it is the
-/// only `unsafe` attribute in the crate and the crate does not perform any unsafe operation.
+/// `unsafe(no_mangle)` is required because the Java side looks the symbol up by name; it and the
+/// JNI exports in `input` are the only `unsafe` attributes in the crate, and no `unsafe` operation
+/// is performed.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub fn android_main(app: AndroidApp) {

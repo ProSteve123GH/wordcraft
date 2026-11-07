@@ -293,6 +293,12 @@ pub struct CanvasState {
 type TablePreviewKey = ((String, serde_json::Value, u64, u64, wordcraft_engine::Selection), std::sync::Arc<DocLayout>);
 
 impl CanvasState {
+    /// The egui id of the page canvas, if it has been drawn. Shells that inject a key after a
+    /// toolbar click use this to restore the page's keyboard focus and its `focused` flag.
+    pub fn widget(&self) -> Option<egui::Id> {
+        self.widget_id.map(|(id, _)| id)
+    }
+
     /// Another document is shown in the window: everything about the page that was shown (drags,
     /// menus, the input method's composition, a scroll in progress, rendered pages…) starts
     /// afresh. What belongs to the window or the user stays: the colours last applied, the

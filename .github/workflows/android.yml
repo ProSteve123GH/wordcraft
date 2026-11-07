@@ -188,6 +188,15 @@ jobs:
           echo "APK=$APK" >> "$GITHUB_ENV"
           ls -lh "$APK"
 
+      # cargo-apk knows nothing about Java sources; compile MainActivity, dex it, add it to the
+      # APK and sign again. The Java class is the Back/IME hook, device listener and window-inset
+      # source that a pure NativeActivity doesn't give us.
+      - name: Package Java shim ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          apps/wordcraft-android/package-java.sh "$APK"
+          ls -lh "$APK"
+
       - name: Verify ${{ matrix.abi }}
         run: |
           set -euo pipefail
@@ -202,6 +211,39 @@ jobs:
           grep -q "targetSdkVersion:'34'" "$OUT"
           grep -q "native-code: '${{ matrix.abi }}'" "$OUT"
           grep -q "application-label:'WordCraft'" "$OUT"
+          grep -q "launchable-activity: name='ai.storyteller.wordcraft.MainActivity'" "$OUT"
+
+          # android:hasCode must be true or Android never loads classes.dex, and the Activity
+          # named in the manifest cannot be found at launch.
+          "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > "$RUNNER_TEMP/manifest.txt"
+          grep -q 'android:hasCode.*0xffffffff' "$RUNNER_TEMP/manifest.txt"
+
+          # A missing JNI export would only crash when the user first presses Back or a physical
+          # keyboard changes the device list, so check the shared object here rather than on the
+          # tablet.
+          LLVM_NM="$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -path '*/bin/llvm-nm' -type f -print -quit)"
+          LIB="$(find target -type f -name 'libwordcraft.so' -path "*${{ matrix.target }}*" -print -quit)"
+          if [ -z "$LIB" ]; then
+            LIB="$(find target -type f -name 'libwordcraft.so' -print -quit)"
+          fi
+          if [ -z "$LLVM_NM" ] || [ -z "$LIB" ]; then
+            echo "cannot find llvm-nm ($LLVM_NM) or libwordcraft.so ($LIB)" >&2
+            exit 1
+          fi
+          SYMS="$RUNNER_TEMP/jni-symbols.txt"
+          "$LLVM_NM" -D --defined-only "$LIB" | awk '{print $NF}' > "$SYMS"
+          for sym in \
+            Java_ai_storyteller_wordcraft_MainActivity_nativeIsEditing \
+            Java_ai_storyteller_wordcraft_MainActivity_nativeShowKeyboard \
+            Java_ai_storyteller_wordcraft_MainActivity_nativeHideKeyboard \
+            Java_ai_storyteller_wordcraft_MainActivity_nativeDevicesChanged \
+            Java_ai_storyteller_wordcraft_MainActivity_nativeWindowInsets
+          do
+            if ! grep -qx "$sym" "$SYMS"; then
+              echo "missing JNI symbol $sym in $LIB" >&2
+              exit 1
+            fi
+          done
 
           "$APKSIGNER" verify --verbose --print-certs "$APK" >> "$OUT"
           echo "--- badging and signature ---"
