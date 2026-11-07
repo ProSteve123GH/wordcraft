@@ -25,6 +25,15 @@ pub mod logging;
 #[cfg(any(target_os = "android", test))]
 mod insets;
 
+/// wgpu backend/adapter policy. The pure selection is host-tested; the wgpu plumbing is Android
+/// only, like the rest of the shell.
+#[cfg(any(target_os = "android", test))]
+mod gpu;
+
+/// Opt-in on-device frame-time benchmark; host-tested statistics.
+#[cfg(any(target_os = "android", test))]
+mod bench;
+
 #[cfg(target_os = "android")]
 mod app;
 

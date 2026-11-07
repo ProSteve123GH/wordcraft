@@ -10,7 +10,7 @@ use winit::platform::android::activity::AndroidApp;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
 
-use crate::{insets, logging};
+use crate::{bench, gpu, insets, logging};
 
 const APP_NAME: &str = "WordCraft";
 
@@ -35,15 +35,27 @@ pub(crate) fn run(android_app: AndroidApp) {
     // navigation bars, so the shell asks the Java side where the content view actually is (see
     // `Shell::raw_input_hook`). `AndroidApp` is a cheap `Arc` clone.
     let insets_app = android_app.clone();
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         android_app: Some(android_app),
         viewport: egui::ViewportBuilder::default().with_title(APP_NAME).with_app_id("ai.storyteller.wordcraft"),
         ..Default::default()
     };
+    // Vulkan first, OpenGL ES as the fallback; the adapter is chosen at runtime and logged. See
+    // `gpu` for why the backends are requested explicitly rather than left to wgpu's defaults.
+    gpu::configure(&mut options);
+
+    let bench_config = bench::BenchConfig::load(data_dir.as_deref());
+    if let Some(config) = bench_config {
+        log::info!("benchmark: {} frames after {} warm-up frames (WORDFCRAFT_BENCH_FRAMES)", config.frames, config.warmup);
+    }
+
     let result = eframe::run_native(
         APP_NAME,
         options,
         Box::new(move |cc| {
+            // The selector already logged its choice; this is the renderer eframe actually made,
+            // including the software-rasteriser warning and the target format.
+            gpu::log_ready(&cc);
             // The system region picks the new document's paper, the units and the decimal separator,
             // as the desktop shell does.
             let region = wordcraft_ui_egui::i18n::system_region();
@@ -60,7 +72,14 @@ pub(crate) fn run(android_app: AndroidApp) {
                     log::warn!("local recovery unavailable: {e}");
                 }
             }
-            Ok(Box::new(Shell { app, android_app: insets_app, content: None, window_px: (0, 0), settle: 3 }))
+            Ok(Box::new(Shell {
+                app,
+                android_app: insets_app,
+                content: None,
+                window_px: (0, 0),
+                settle: 3,
+                bench: bench_config.map(bench::FrameBench::new),
+            }))
         }),
     );
 
@@ -82,6 +101,8 @@ struct Shell {
     window_px: (i32, i32),
     /// Extra frames to ask for after startup or a resize while the Java side catches up.
     settle: u8,
+    /// The opt-in frame-time benchmark, or `None` for normal reactive repainting.
+    bench: Option<bench::FrameBench>,
 }
 
 impl eframe::App for Shell {
@@ -90,6 +111,9 @@ impl eframe::App for Shell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.app.logic(ctx);
         self.watch_system_bars(ctx);
+        if self.bench.as_ref().is_some_and(bench::FrameBench::wanted) {
+            ctx.request_repaint();
+        }
     }
 
     /// Hands egui the part of the surface the system bars leave free.
@@ -141,7 +165,7 @@ impl eframe::App for Shell {
     }
 
     /// The real WordCraft interface: ribbon, rulers, page canvas, panes and status bar.
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // eframe's root `Ui` still covers the whole viewport; lay the interface out only in the
         // part the system bars leave free. Everything WordCraft draws is a panel inside this `Ui`,
         // so the ribbon starts below the status bar and the status bar above the gesture bar.
@@ -152,6 +176,9 @@ impl eframe::App for Shell {
         } else {
             // A stale or nonsensical rectangle must never blank the whole interface.
             self.app.ui(ui);
+        }
+        if let Some(bench) = &mut self.bench {
+            bench.record(frame.info().cpu_usage);
         }
     }
 

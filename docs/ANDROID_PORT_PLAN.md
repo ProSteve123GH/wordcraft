@@ -1,8 +1,9 @@
 # WordCraft on Android — port plan
 
-**Status:** Phase 1 implemented; both APK ABIs build and verify in CI. The first device run showed the
-ribbon under the status bar; the shell now applies the Activity's content rectangle (see §3) and the
-fix is awaiting re-test on the tablet.
+**Status:** Phases 1 and 2 implemented; both APK ABIs build and verify in CI. The first device run
+showed the ribbon under the status bar; the shell now applies the Activity's content rectangle (see
+§3) and the fix is awaiting re-test on the tablet. Phase 2 adds runtime Vulkan/OpenGL ES adapter
+selection and an opt-in frame-time benchmark (§9); Phase 3 (input/IME/Back) is next.
 **This is a fork addition.** Upstream WordCraft targets macOS, Windows, Linux, the BSDs and the web;
 the Android port lives in `apps/wordcraft-android/` and keeps the desktop, web and CLI builds intact.
 
@@ -203,6 +204,43 @@ built both APKs. `aapt2 dump badging` reported package `ai.storyteller.wordcraft
 `apksigner verify` accepted v2/v3 signatures. The upstream [CI gate 42244009696](https://github.com/ProSteve123GH/wordcraft/actions/runs/42244009696)
 also passed, so the host workspace, formatting, clippy, tests, assets and layering checks stay green.
 
+## 9. Phase 2 implementation: GPU backends and performance
+
+Phase 2 keeps the CPU page rasteriser (it is the document renderer, not a graphics fallback) and
+makes the wgpu presentation path explicit and observable.
+
+| Path | What it does |
+|---|---|
+| `apps/wordcraft-android/src/gpu.rs` | Pure adapter ranking plus the Android wgpu setup: Vulkan + GLES instance, surface-compatible adapter filter, hardware/software policy, clamped GLES device limits, startup logs. Host tests cover the ranking. |
+| `apps/wordcraft-android/src/bench.rs` | Opt-in frame-time benchmark (`WORDFCRAFT_BENCH_FRAMES` or `<internal data>/bench.conf`), percentile statistics, CPU-time and frame-interval summary. Host tests cover parsing and statistics. |
+| `apps/wordcraft-android/src/app.rs` | Applies the wgpu setup, logs the renderer eframe created, runs the benchmark loop without changing normal reactive repainting. |
+| `apps/wordcraft-android/README.md` | Backend policy, log lines and benchmark instructions. |
+
+**Backends.** The instance requests `VULKAN | GL`, so wgpu enumerates both. The selector checks
+`Adapter::is_surface_supported` before ranking, then prefers hardware Vulkan, then hardware GLES;
+`DeviceType::Cpu` adapters are rejected unless `WORDFCRAFT_ALLOW_SOFTWARE_GPU=1` (or
+`WORDFCRAFT_GPU=software`). `WORDFCRAFT_GPU=vulkan|gles` and `WGPU_BACKEND` narrow the list for
+diagnostics, with an invalid/empty selection falling back to both. The GL device request uses
+`Limits::downlevel_webgl2_defaults` and `min(8192, adapter.limits().max_texture_dimension_2d)`; the
+Vulkan request keeps egui's normal limits.
+
+**Pause/resume and allocations.** eframe/winit suspend the event loop on `onPause` and recreate the
+surface on resume; egui-wgpu's default surface-status callback reconfigures on `Outdated` and
+recreates on `Lost`. The shell creates no per-frame wgpu resources; the texture atlas and page
+textures are owned by the renderer/session. The surface uses egui's low-latency configuration and
+normal reactive repainting, so an idle document does not repaint in a loop.
+
+**Benchmark.** The benchmark is off by default. When enabled it requests continuous repaints for
+`frames + warmup` frames, records eframe's `IntegrationInfo::cpu_usage` (UI + layout + rasterisation +
+submission, excluding vsync) and the wall-clock inter-frame interval, drops the warm-up samples and
+logs count/min/avg/p50/p95/max plus FPS. The app keeps running afterwards. The file form exists
+because setting an environment variable for an installed Android Activity is not practical; the
+pure `parse_config`/`summarize` functions are host-tested.
+
+**Not done in Phase 2:** per-draw GPU timestamps (require `TIMESTAMP_QUERY` and external tooling),
+an in-app backend switcher, and an automated on-device benchmark in CI. The adapter choice and the
+benchmark are manual device checks.
+
 ## Revision history
 
 | Date | Change |
@@ -211,3 +249,4 @@ also passed, so the host workspace, formatting, clippy, tests, assets and layeri
 | 2026-11-06 | Phase 1 implementation: crate, shell, theme, logging, fonts, layering, workflow and README added. cargo-apk pinned to 0.10.0 so the `[lib] name = "wordcraft"` artifact is found. |
 | 2026-11-06 | CI: both ABIs built, badging and v2/v3 signatures verified; upstream CI gate green. Device verification remains. |
 | 2026-11-07 | First device run: ribbon drawn under the status bar. Root cause: `ANativeWindow` is the whole window, not the content area, and winit ignores `ContentRectChanged`. Fix: read `AndroidApp::content_rect`, set egui's safe area and lay out inside `Context::content_rect`; host tests for the inset arithmetic; theme comment corrected (`NativeActivity` sets `adjustResize`). |
+| 2026-11-07 | Phase 2: explicit Vulkan + OpenGL ES instance, surface-compatible hardware adapter selection (software only by diagnostic opt-in), GLES limit clamping, startup renderer logs, opt-in frame-time benchmark with file/env configuration, host tests and README. |
