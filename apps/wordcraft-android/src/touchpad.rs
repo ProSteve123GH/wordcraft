@@ -399,8 +399,9 @@ impl Touchpad {
             Mode::One if self.touches.len() == 1 => self.moved_one(previous, pos, moved, &mut out),
             Mode::Two => self.moved_two(sample.time, &mut out),
             Mode::Three => self.moved_three(&mut out),
-            // `Cancel` clears everything; a move without a known touch id is stale.
-            Mode::Idle | Mode::Ignore => {}
+            // `One` with more than one recorded touch is stale until the next `end`; `Cancel`
+            // clears everything, and a move without a known touch id is stale too.
+            Mode::One | Mode::Idle | Mode::Ignore => {}
         }
         out
     }
