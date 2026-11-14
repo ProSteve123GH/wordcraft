@@ -27,10 +27,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: release-${{ github.ref_name }}
-  cancel-in-progress: false
-
 jobs:
   release:
     name: Termux .deb (release, aarch64)
