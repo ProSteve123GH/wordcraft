@@ -7,7 +7,7 @@ default-members = ["crates/*", "apps/wordcraft", "apps/wordcraft-cli", "xtask"]
 
 [workspace.package]
 # The fork's own version line: releases start at 0.0.1 (the release workflow bumps this).
-version = "0.0.1"
+version = "0.18.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
