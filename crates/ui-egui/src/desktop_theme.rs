@@ -3,6 +3,10 @@
 //! winit reports no system theme on Linux — `ActiveEventLoop::system_theme` is `None` on every
 //! desktop there — so "Use system setting" has to ask the desktop itself. The XDG Desktop Portal's
 //! Settings interface answers on GNOME, KDE and XFCE alike, over X11 and Wayland alike.
+//!
+//! On Android (Termux) there is no portal and no session bus to ask: the X11 settings manager
+//! (`xfsettingsd` on XFCE) or, when that isn't running, the desktop's own `settings.ini` and
+//! XFCE `xsettings` files answer instead (see [`xsettings_dark`] and [`settings_files_dark`]).
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
@@ -142,10 +146,201 @@ fn parse(scheme: &str) -> Option<bool> {
     }
 }
 
-/// macOS and Windows answer through winit, which the caller already has.
-#[cfg(not(target_os = "linux"))]
+/// Android has no portal to ask, so the X11 settings manager (XFCE's `xfsettingsd`) and the
+/// desktop's own settings files answer instead. Both are read on each poll, so a theme change
+/// shows without a restart.
+#[cfg(target_os = "android")]
+fn read(_bus: &mut Bus) -> Option<bool> {
+    xsettings_dark().or_else(settings_files_dark)
+}
+
+/// macOS and Windows answer through winit, which the caller already has; the other Unixes keep
+/// their own choice when no portal answers.
+#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
 fn read(_bus: &mut Bus) -> Option<bool> {
     None
+}
+
+/// An XSETTINGS value: the X11 settings manager's serialized properties.
+#[cfg(target_os = "android")]
+#[derive(Debug, PartialEq)]
+enum XValue {
+    Integer(i32),
+    Text(String),
+}
+
+/// The value of `want` in an `_XSETTINGS_SETTINGS` blob, if it holds that setting. The format is
+/// the one in the XSETTINGS specification: a one-byte byte-order marker (`l` or `B`, anything else
+/// native) and padding, the setting count, then type/name/value records with four-byte alignment.
+#[cfg(target_os = "android")]
+fn xsettings_value(bytes: &[u8], want: &str) -> Option<XValue> {
+    let big = match bytes.first()? {
+        b'B' => true,
+        b'l' => false,
+        _ => cfg!(target_endian = "big"),
+    };
+    let i16_at = |at: usize| -> Option<i16> {
+        let b: [u8; 2] = bytes.get(at..at + 2)?.try_into().ok()?;
+        Some(if big { i16::from_be_bytes(b) } else { i16::from_le_bytes(b) })
+    };
+    let i32_at = |at: usize| -> Option<i32> {
+        let b: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        Some(if big { i32::from_be_bytes(b) } else { i32::from_le_bytes(b) })
+    };
+    let mut at = 8; // byte order, three padding bytes and the serial
+    let count = i32_at(at)?.max(0) as usize;
+    at += 4;
+    for _ in 0..count {
+        let ty = *bytes.get(at)?;
+        at += 2; // type and one padding byte
+        let name_len = i16_at(at)?.max(0) as usize;
+        at += 2;
+        let name = bytes.get(at..at + name_len)?;
+        at = (at + name_len + 3) & !3;
+        at += 4; // the setting's serial
+        let value = match ty {
+            0 => {
+                let n = i32_at(at)?;
+                at += 4;
+                XValue::Integer(n)
+            }
+            1 => {
+                let len = i32_at(at)?.max(0) as usize;
+                at += 4;
+                let text = bytes.get(at..at + len)?;
+                at = (at + len + 3) & !3;
+                XValue::Text(String::from_utf8_lossy(text).into_owned())
+            }
+            2 => {
+                at += 8; // four 16-bit colour components
+                continue;
+            }
+            _ => return None,
+        };
+        if name == want.as_bytes() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Whether the X11 settings manager asks for a dark interface: GTK's prefer-dark switch, else a
+/// theme name that says so. `None` when no manager is running (a bare X server).
+#[cfg(target_os = "android")]
+fn xsettings_dark() -> Option<bool> {
+    use x11rb::protocol::xproto::ConnectionExt;
+
+    let (connection, screen) = x11rb::connect(None).ok()?;
+    let intern = |name: &str| -> Option<u32> { Some(connection.intern_atom(false, name.as_bytes()).ok()?.reply().ok()?.atom) };
+    let selection = intern(&format!("_XSETTINGS_S{screen}"))?;
+    // The manager owns `_XSETTINGS_S<screen>` as a selection (not a property of the root) and
+    // publishes its settings on the owner window; winit reads it the same way for DPI.
+    let owner = connection.get_selection_owner(selection).ok()?.reply().ok()?.owner;
+    if owner == x11rb::NONE {
+        return None;
+    }
+    let settings = intern("_XSETTINGS_SETTINGS")?;
+    let property = connection.get_property(false, owner, settings, settings, 0, 1 << 20).ok()?.reply().ok()?;
+    if property.format != 8 {
+        return None;
+    }
+    let theme = match xsettings_value(&property.value, "Net/ThemeName") {
+        Some(XValue::Text(name)) => Some(name),
+        _ => None,
+    };
+    let prefer = match xsettings_value(&property.value, "Gtk/ApplicationPreferDarkTheme") {
+        Some(XValue::Integer(on)) => Some(on),
+        _ => None,
+    };
+    prefer_dark_answer(theme.as_deref(), prefer)
+}
+
+/// GTK's explicit "prefer dark" switch selects the theme's dark variant, so it wins over the
+/// name (Adwaita draws dark even as "Adwaita" while the switch is on). Without the switch the
+/// name decides; with neither, the desktop says nothing.
+#[cfg(target_os = "android")]
+fn prefer_dark_answer(theme_name: Option<&str>, prefer: Option<i32>) -> Option<bool> {
+    match prefer {
+        Some(on) if on != 0 => Some(true),
+        _ => theme_name.map(is_dark_name),
+    }
+}
+
+/// Whether the user's own settings files ask for dark, for when no settings manager is running:
+/// GTK's `settings.ini` (that is what its switch lives in) and XFCE's stored `xsettings` channel
+/// (its settings editor writes it within a couple of seconds of a change).
+#[cfg(target_os = "android")]
+fn settings_files_dark() -> Option<bool> {
+    gtk_settings_dark().or_else(xfce_theme_dark)
+}
+
+/// The directory desktop settings files live in: `$XDG_CONFIG_HOME`, else `~/.config`.
+#[cfg(target_os = "android")]
+fn settings_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").filter(|p| !p.is_empty()).map(|h| std::path::PathBuf::from(h).join(".config")))
+}
+
+/// GTK 4's or GTK 3's `settings.ini`, the first that answers.
+#[cfg(target_os = "android")]
+fn gtk_settings_dark() -> Option<bool> {
+    let root = settings_root()?;
+    for version in ["gtk-4.0", "gtk-3.0"] {
+        let Ok(text) = std::fs::read_to_string(root.join(version).join("settings.ini")) else { continue };
+        if let Some(on) = ini_value(&text, "Settings", "gtk-application-prefer-dark-theme") {
+            return Some(matches!(on.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+        }
+        if let Some(name) = ini_value(&text, "Settings", "gtk-theme-name") {
+            return Some(is_dark_name(name));
+        }
+    }
+    None
+}
+
+/// The `Net/ThemeName` in XFCE's `xsettings.xml`, when the settings editor has stored one.
+#[cfg(target_os = "android")]
+fn xfce_theme_dark() -> Option<bool> {
+    let text = std::fs::read_to_string(settings_root()?.join("xfce4/xfconf/xfce-perchannel-xml/xsettings.xml")).ok()?;
+    Some(is_dark_name(xml_value(&text, "ThemeName")?))
+}
+
+/// A value in an INI file's section, the last one winning, as the toolkits read it.
+#[cfg(target_os = "android")]
+fn ini_value<'a>(text: &'a str, section: &str, key: &str) -> Option<&'a str> {
+    let mut inside = false;
+    let mut found = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            inside = name.trim() == section;
+        } else if inside
+            && !line.starts_with(['#', ';'])
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim() == key
+        {
+            found = Some(v.trim());
+        }
+    }
+    found
+}
+
+/// The `value="..."` of the `<property name="`name`">` element in XFCE's XML. An empty property
+/// (`type="empty"`) has none.
+#[cfg(target_os = "android")]
+fn xml_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let start = text.find(&format!("name=\"{name}\""))?;
+    let tag_end = start + text[start..].find('>')?;
+    let tag = &text[start..tag_end];
+    let after = &tag[tag.find("value=\"")? + 7..];
+    Some(&after[..after.find('"')?])
+}
+
+/// A theme name that asks for a dark interface; XFCE names its dark variants that way
+/// (`Adwaita-dark`, `Greybird-dark`, `Matcha-dark-azul`).
+#[cfg(target_os = "android")]
+fn is_dark_name(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("dark")
 }
 
 #[cfg(test)]
@@ -162,11 +357,63 @@ mod tests {
         assert_eq!(parse(""), None);
     }
 
-    /// Off Linux the caller already has winit's answer, so this adds nothing.
+    /// On macOS and Windows the caller already has winit's answer, so this adds nothing.
     #[test]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn other_platforms_answer_through_winit() {
         assert_eq!(prefers_dark(), None);
+    }
+
+    /// XSETTINGS records, as XFCE's settings manager serializes them.
+    #[test]
+    #[cfg(target_os = "android")]
+    fn xsettings_records_read_like_the_specification() {
+        fn setting(ty: u8, name: &str, value: &[u8]) -> Vec<u8> {
+            let mut out = vec![ty, 0, name.len() as u8, 0];
+            out.extend_from_slice(name.as_bytes());
+            out.resize(4 + name.len().div_ceil(4) * 4, 0);
+            out.extend_from_slice(&0u32.to_le_bytes()); // serial
+            out.extend_from_slice(value);
+            out
+        }
+        let mut blob = b"l\0\0\0\0\0\0\0".to_vec();
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(&setting(0, "Xft/DPI", &(96 * 1024i32).to_le_bytes()));
+        blob.extend_from_slice(&setting(1, "Net/ThemeName", &{
+            let mut v = (12u32).to_le_bytes().to_vec();
+            v.extend_from_slice(b"Adwaita-dark");
+            v
+        }));
+        assert_eq!(xsettings_value(&blob, "Net/ThemeName"), Some(XValue::Text("Adwaita-dark".into())));
+        assert_eq!(xsettings_value(&blob, "Xft/DPI"), Some(XValue::Integer(96 * 1024)));
+        assert_eq!(xsettings_value(&blob, "Gtk/ApplicationPreferDarkTheme"), None);
+    }
+
+    /// The XFCE settings file and GTK's INI say the same thing in their own formats.
+    #[test]
+    #[cfg(target_os = "android")]
+    fn settings_files_name_the_theme() {
+        let xml = r#"<property name="Net" type="empty">
+    <property name="ThemeName" type="string" value="Adwaita-dark"/>
+    <property name="IconThemeName" type="empty"/>
+  </property>"#;
+        assert_eq!(xml_value(xml, "ThemeName"), Some("Adwaita-dark"));
+        assert_eq!(xml_value(xml, "IconThemeName"), None);
+        assert!(is_dark_name("Greybird-dark"));
+        assert!(!is_dark_name("Adwaita"));
+        let ini = "[Settings]\ngtk-theme-name=Adwaita-dark\n";
+        assert_eq!(ini_value(ini, "Settings", "gtk-theme-name"), Some("Adwaita-dark"));
+        assert_eq!(ini_value(ini, "Other", "gtk-theme-name"), None);
+    }
+
+    /// GTK's prefer-dark switch wins over the theme name when the two disagree.
+    #[test]
+    #[cfg(target_os = "android")]
+    fn the_prefer_dark_switch_wins_over_the_name() {
+        assert_eq!(prefer_dark_answer(Some("Adwaita"), Some(1)), Some(true));
+        assert_eq!(prefer_dark_answer(Some("Adwaita-dark"), Some(0)), Some(true));
+        assert_eq!(prefer_dark_answer(Some("Adwaita"), Some(0)), Some(false));
+        assert_eq!(prefer_dark_answer(None, None), None);
     }
 
     /// A watcher that was never started is inert rather than a panic.

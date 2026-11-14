@@ -1,14 +1,17 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
+# Termux port: vendored dependency workspaces (egui) must not be claimed by this one.
+exclude = ["vendor"]
 default-members = ["crates/*", "apps/wordcraft", "apps/wordcraft-cli", "xtask"]
 
 [workspace.package]
-version = "0.18.1"
+# The fork's own version line: releases start at 0.0.1 (the release workflow bumps this).
+version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.95"
-repository = "https://github.com/storytold/wordcraft"
+repository = "https://github.com/ProSteve123GH/wordcraft"
 
 [workspace.dependencies]
 # internal
@@ -132,21 +135,27 @@ lto = "thin"
 codegen-units = 16
 debug = 0
 
-# Required by craft-pdf: the backend rejects writers that failed during unwinding.
+# --- Termux port -------------------------------------------------------------
+# The egui fork, winit, arboard and rfd run their desktop (X11) code on Android,
+# so their sources are vendored under vendor/ and patched in place (see vendor/README.md).
 [patch.crates-io]
 krilla = { git = "https://github.com/storytold/craft-libs", rev = "6e03f65bf45181db77ba6229716e6624db9eb25b" }
-ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-epaint_default_fonts = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui-winit = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui-wgpu = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui_glow = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui_extras = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui_kittest = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui_system_font_provider = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui_demo_lib = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-egui_inspection = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
+eframe = { path = "vendor/egui/crates/eframe" }
+egui = { path = "vendor/egui/crates/egui" }
+egui-wgpu = { path = "vendor/egui/crates/egui-wgpu" }
+egui-winit = { path = "vendor/egui/crates/egui-winit" }
+egui_extras = { path = "vendor/egui/crates/egui_extras" }
+egui_glow = { path = "vendor/egui/crates/egui_glow" }
+egui_kittest = { path = "vendor/egui/crates/egui_kittest" }
+egui_demo_lib = { path = "vendor/egui/crates/egui_demo_lib" }
+egui_inspection = { path = "vendor/egui/crates/egui_inspection" }
+egui_system_font_provider = { path = "vendor/egui/crates/egui_system_font_provider" }
+ecolor = { path = "vendor/egui/crates/ecolor" }
+emath = { path = "vendor/egui/crates/emath" }
+epaint = { path = "vendor/egui/crates/epaint" }
+epaint_default_fonts = { path = "vendor/egui/crates/epaint_default_fonts" }
+winit = { path = "vendor/winit" }
+arboard = { path = "vendor/arboard" }
+rfd = { path = "vendor/rfd" }
+accesskit_winit = { path = "vendor/accesskit_winit" }
+x11rb-protocol = { path = "vendor/x11rb-protocol" }

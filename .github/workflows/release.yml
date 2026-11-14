@@ -1,62 +1,136 @@
 name: Release
 
+# Builds the port and publishes a GitHub release.
+#
+#  * Push a tag (`git tag v0.0.1 && git push origin v0.0.1`) to release exactly that version.
+#  * Or run the workflow by hand: it bumps `[workspace.package] version` in Cargo.toml, commits
+#    and pushes the bump, then builds and releases. Releases start at 0.0.1 and go up from the
+#    latest tag (patch by default; choose minor or major, or type an exact version).
+#
+# The artifact is the Linux x86-64 desktop build. The Termux (Android arm64) binary needs
+# Termux's own $PREFIX libraries, so it is built on the device with `bash build-termux.sh`.
 on:
-  # A nightly dry run on main: every release build except macOS, nothing signed or released
-  # (craft-common-actions release.yml `dry-run`). Finds release-only breakage before release day.
-  schedule:
-    - cron: "0 3 * * *"
   push:
-    branches: [release]
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version override for a test run, e.g. 0.2.0-rc.1 (empty: Cargo.toml)"
+        description: "Exact version to release, e.g. 0.0.2 (empty: bump from the latest tag)"
         type: string
         default: ""
+      bump:
+        description: "Bump to apply when no exact version is given"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # Regenerates contributors/contributors.json for the release commit; every build bundles it.
-  credits:
-    permissions:
-      contents: read
-      pull-requests: read
-    uses: storytold/craft-common-actions/.github/workflows/refresh-contributors.yml@main
   release:
-    needs: credits
-    # Only this job publishes the GitHub release, so only it gets write access.
-    permissions:
-      contents: write
-      packages: write
-    # Intentionally tracked at @main (not SHA-pinned) so org-wide CI improvements, security fixes, and build optimizations propagate without PR churn across all craftapp repos.
-    uses: storytold/craft-common-actions/.github/workflows/release.yml@main
-    with:
-      dry-run: ${{ github.event_name == 'schedule' }}
-      app-name: wordcraft
-      app-title: WordCraft
-      craft-fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
-      web-craft-fonts: true
-      version: ${{ inputs.version }}
-      contributors-artifact: ${{ needs.credits.outputs.artifact-name }}
-    secrets:
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-      AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
-      AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
-      AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
-      LINUX_SIGNING_KEY: ${{ secrets.LINUX_SIGNING_KEY }}
+    name: Release (Linux x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="$GITHUB_REF_NAME"
+          else
+            VERSION="${INPUT_VERSION#v}"
+            if [ -z "$VERSION" ]; then
+              last="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+              last="${last#v}"
+              last="${last:-0.0.0}"
+              IFS=. read -r major minor patch <<< "$last"
+              case "$INPUT_BUMP" in
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                *)     patch=$((patch + 1)) ;;
+              esac
+              VERSION="$major.$minor.$patch"
+            fi
+            TAG="v$VERSION"
+            # The released binary should report the released version.
+            sed -i -E '0,/^version = "[0-9]+\.[0-9]+\.[0-9]+"$/s//version = "'"$VERSION"'"/' Cargo.toml
+            cargo update --workspace
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "Cargo.toml already at $VERSION; nothing to commit."
+            else
+              git commit -m "Release v$VERSION"
+              if [ "$GITHUB_REF_TYPE" = "branch" ]; then
+                git push origin "HEAD:$GITHUB_REF_NAME"
+              else
+                echo "Not on a branch; leaving the bump commit local." >&2
+              fi
+            fi
+          fi
+          sha="$(git rev-parse HEAD)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG from $sha"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libgtk-3-dev libfontconfig1-dev libfreetype-dev
+
+      - name: Build
+        run: cargo build --release --locked -p wordcraft -p wordcraft-cli
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p dist
+          cp target/release/wordcraft target/release/wordcraft-cli dist/
+          cp README.md TERMUX.md dist/
+          tar -czf "wordcraft-${VERSION}-linux-x86_64.tar.gz" -C dist .
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          asset="wordcraft-${VERSION}-linux-x86_64.tar.gz"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; replacing its asset."
+            gh release upload "$TAG" "$asset" --clobber
+          elif git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            gh release create "$TAG" "$asset" --title "WordCraft $TAG" --verify-tag --generate-notes
+          else
+            gh release create "$TAG" "$asset" --title "WordCraft $TAG" --target "$SHA" --generate-notes
+          fi
