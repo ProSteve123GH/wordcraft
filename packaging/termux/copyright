@@ -1,0 +1,11 @@
+WordCraft is a native Rust word processor, ported to Termux (Android, X11) in this repository.
+
+Upstream: https://github.com/storytold/wordcraft
+This port: https://github.com/ProSteve123GH/wordcraft
+
+License: MIT OR Apache-2.0, at your option. The full texts are in the upstream repository:
+  https://github.com/storytold/wordcraft/blob/main/LICENSE-MIT
+  https://github.com/storytold/wordcraft/blob/main/LICENSE-APACHE
+
+The package bundles no fonts, icons or other artwork from Microsoft Office or any other
+proprietary product. The application icon is part of the upstream project's own asset set.

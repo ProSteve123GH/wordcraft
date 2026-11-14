@@ -1,0 +1,74 @@
+name: Termux package
+
+# Builds the real Termux (Android aarch64) .deb in a Termux container on GitHub's arm64 runner.
+# Run it by hand from the Actions tab. Set "Release tag" to also attach the .deb to an existing
+# release (e.g. v0.0.1); leave it empty to only keep the .deb as a run artifact.
+#
+# Why a container: the app links against Termux's own $PREFIX libraries, so it must be built with
+# Termux's bionic toolchain. On an x86 runner that would need QEMU; on ubuntu-24.04-arm the
+# termux/termux-docker:aarch64 image runs natively and gives the same environment as the tablet.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the .deb to (e.g. v0.0.1; empty: artifact only)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: termux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deb:
+    name: Termux .deb (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build in a Termux container
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          chmod 777 out
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/out:/out" \
+            -e CARGO_BUILD_JOBS=4 \
+            -e CARGO_PROFILE_DEV_DEBUG=0 \
+            termux/termux-docker:aarch64 \
+            bash -lc '
+              set -eu
+              cp -a /src /tmp/wordcraft
+              cd /tmp/wordcraft
+              pkg update -y
+              pkg install -y rust git
+              bash build-termux.sh
+              bash package-termux.sh
+              cp dist/*.deb /out/
+            '
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: termux-deb
+          path: out/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach to the release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          # The .deb can finish before the release workflow has published the release.
+          for _ in $(seq 1 60); do
+            gh release view "$TAG" >/dev/null 2>&1 && break
+            sleep 30
+          done
+          gh release upload "$TAG" out/*.deb --clobber

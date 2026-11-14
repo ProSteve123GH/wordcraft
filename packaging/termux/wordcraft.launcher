@@ -1,0 +1,26 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# WordCraft launcher for Termux.
+#
+# Rendering goes through Mesa's software rasteriser (llvmpipe) by default. For hardware
+# acceleration on devices where VirGL works:
+#
+#   pkg install virglrenderer-android
+#   virgl_test_server_android &
+#   GALLIUM_DRIVER=virpipe wordcraft
+#
+# Termux:X11 must be open and running (DISPLAY defaults to :0).
+set -e
+
+: "${DISPLAY:=:0}"
+export DISPLAY
+# The Mali driver cannot present Vulkan surfaces to X11; OpenGL is the path.
+: "${WGPU_BACKEND:=gl}"
+export WGPU_BACKEND
+# No xdg-desktop-portal in Termux: use WordCraft's own file browser.
+: "${WORDCRAFT_FILE_DIALOG:=builtin}"
+export WORDCRAFT_FILE_DIALOG
+# Android has no writable /tmp; Termux:X11 keeps its socket in $PREFIX/tmp/.X11-unix.
+: "${X11_UNIX_SOCKET_DIR:=$PREFIX/tmp/.X11-unix}"
+export X11_UNIX_SOCKET_DIR
+
+exec "$PREFIX/libexec/wordcraft/wordcraft" "$@"

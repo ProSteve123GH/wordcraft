@@ -135,6 +135,25 @@ is absolute, so 100% is one screen pixel per point. Document zoom is separate (`
 - The control channel's key file (`~/.config/wordcraft/control-key.local-<port>`) is removed when
   the app exits.
 
+## Install as a Termux package
+
+The build can be packaged as an ordinary Termux `.deb`:
+
+```bash
+bash build-termux.sh
+bash package-termux.sh                              # -> dist/wordcraft_0.0.1_aarch64.deb
+pkg install ./dist/wordcraft_0.0.1_aarch64.deb      # or: dpkg -i <file>
+wordcraft
+```
+
+The package puts the launcher in `$PREFIX/bin/wordcraft` and the app in `$PREFIX/libexec/wordcraft/`,
+and installs a desktop entry and icon. It declares the X11 and Mesa dependencies, and deliberately
+does **not** depend on the VirGL server: rendering uses Mesa's software rasteriser (llvmpipe) by
+default. On devices where VirGL works, install `virglrenderer-android`, start
+`virgl_test_server_android`, and run `GALLIUM_DRIVER=virpipe wordcraft`.
+`pkg uninstall wordcraft` removes it. `wordcraft-cli` is included when it has been built
+(`cargo build -p wordcraft-cli`).
+
 ## Builds and releases
 
 `.github/workflows/build.yml` builds the debug app on Linux x86-64 for every push and pull request
@@ -146,9 +165,11 @@ publishes a GitHub release:
   the latest tag — patch by default, starting at 0.0.1 — commits the bump, builds and releases. You
   can pick minor or major, or type an exact version.
 
-Neither workflow produces the Termux binary: that needs Termux's own `$PREFIX` libraries, which no
-GitHub runner has, so it is built on the device with `build-termux.sh`. The released artifact is
-the desktop (Linux x86-64) build.
+Neither workflow produces the Termux binary: that needs Termux's own `$PREFIX` libraries, which the
+x86-64 runner does not have, so the release asset is the desktop (Linux x86-64) build. The tablet
+build stays `build-termux.sh` on-device, or `.github/workflows/termux.yml` (manual): it builds the
+aarch64 `.deb` inside the `termux/termux-docker:aarch64` container on GitHub's free arm64 runner and
+can attach it to a release by tag.
 
 ## Known limits
 
