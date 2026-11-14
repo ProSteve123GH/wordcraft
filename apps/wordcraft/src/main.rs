@@ -620,7 +620,12 @@ fn main() -> eframe::Result {
             let mut session = Session::new(doc);
             session.system_region = region;
             let mut app = WordApp::new(session, services(file_dialog, cancel_file_dialog, &cc.egui_ctx));
+            // The Termux build ships the same interface but is installed from a .deb, and its
+            // TLS verifier is not available: no check at start, and the menu says why.
+            #[cfg(not(target_os = "android"))]
             app.set_startup_update_check(true);
+            #[cfg(target_os = "android")]
+            app.disable_updates_for_termux();
             load_prefs(&mut app);
             // After the preferences, so the reason it gives is in the interface language.
             if updates_unsafe {

@@ -180,9 +180,9 @@ needs secrets beyond the workflow's own `GITHUB_TOKEN`.
 - **No xdg-desktop-portal**, so WordCraft uses its own file browser (`WORDCRAFT_FILE_DIALOG=builtin`).
 - **No AT-SPI accessibility bus**, so screen-reader integration is inactive (the app's own
   accessibility tree still builds).
-- **No self-update**: this is a local port, not a packaged release. The update check also fails
-  on Android because `rustls-platform-verifier` wants an Android activity it does not get here;
-  the failure is caught and logged, nothing else is affected.
+- **No self-update**: the package is installed with `pkg` from a `.deb`, and Android's TLS
+  certificate verifier (which `craft-update` uses) needs a JVM that Termux does not run. The Termux
+  build skips the check at start, and Help ▸ Check for Updates says where the package comes from.
 
 Harmless messages you will see at startup:
 

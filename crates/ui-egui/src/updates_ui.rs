@@ -87,6 +87,25 @@ fn refused_check() -> craft_update::updater::CheckSource {
     std::sync::Arc::new(move || Err(why.clone()))
 }
 
+/// The Termux build checks nothing and says where its updates come from. This package is
+/// installed with `pkg` from a `.deb`, and `craft-update`'s HTTP client uses Android's TLS
+/// certificate verifier, which needs a JVM that Termux does not run: a check would panic in its
+/// task. Help ▸ Check for Updates answers with the reason instead.
+#[cfg(target_os = "android")]
+impl WordApp {
+    pub fn disable_updates_for_termux(&mut self) {
+        let rt = &mut self.updates_rt;
+        rt.startup_check = false;
+        rt.updater = Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).with_translator(translate).with_source(termux_check());
+    }
+}
+
+#[cfg(target_os = "android")]
+fn termux_check() -> craft_update::updater::CheckSource {
+    let why = tl!("Updates for Termux are installed with pkg: download the new .deb from the releases page.").to_string();
+    std::sync::Arc::new(move || Err(why.clone()))
+}
+
 pub(crate) fn check(app: &mut WordApp) {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -282,5 +301,26 @@ mod tests {
             assert!(!app.updates_rt.manual_window_open, "{file}: the window stays closed");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// The Termux build checks nothing at start, and Help ▸ Check for Updates ends in the reason
+    /// instead of panicking in its task (Android's TLS verifier needs a JVM Termux does not run).
+    #[cfg(target_os = "android")]
+    #[test]
+    fn the_termux_build_never_checks_for_updates() {
+        let mut app = crate::WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), crate::Services::default());
+        app.set_startup_update_check(true);
+        app.disable_updates_for_termux();
+        assert!(!app.updates_rt.startup_check, "no check at start");
+        let ctx = egui::Context::default();
+        super::check(&mut app);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(app.updates_rt.updater.status(), Status::Failed(_)) {
+            assert!(std::time::Instant::now() < deadline, "the check never ended: {:?}", app.updates_rt.updater.status());
+            super::tick(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let status = app.updates_rt.updater.status();
+        assert!(matches!(status, Status::Failed(why) if why.contains("installed with pkg")), "{status:?}");
     }
 }
