@@ -43,8 +43,8 @@ jobs:
             termux/termux-docker:aarch64 \
             bash -lc '
               set -eu
-              cp -a /src /tmp/wordcraft
-              cd /tmp/wordcraft
+              cp -a /src "$HOME/wordcraft"
+              cd "$HOME/wordcraft"
               pkg update -y
               pkg install -y rust git
               bash build-termux.sh
