@@ -114,6 +114,7 @@ jobs:
             -v "$PWD:/src:ro" \
             -v "$PWD/out:/out" \
             -e CARGO_BUILD_JOBS=4 \
+            -e WORDCRAFT_BUILD_SHA="$GITHUB_SHA" \
             termux/termux-docker:aarch64 \
             bash -lc '
               set -eu
