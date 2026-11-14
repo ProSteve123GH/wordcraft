@@ -1,11 +1,7 @@
 name: Build
 
-# Debug build of the port on Linux x86-64: proves the workspace compiles and leaves a binary you
-# can download from the run's Artifacts.
-#
-# This does not produce the Termux (Android arm64) binary: that needs Termux's own $PREFIX
-# libraries, which no GitHub runner has. Build the Termux binary on the device with
-# `bash build-termux.sh` (see TERMUX.md).
+# Debug build of the Termux app: compiles inside a real Termux (bionic, aarch64) container on
+# GitHub's free arm64 runner and packages it as a .deb. The .deb is attached to the run.
 on:
   push:
     branches: [main]
@@ -20,36 +16,38 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  debug:
-    name: Debug (Linux x86-64)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+  deb:
+    name: Termux .deb (debug, aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: debug
-      - name: Install system libraries
+      - name: Build in a Termux container
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libxkbcommon-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
-            libgtk-3-dev libfontconfig1-dev libfreetype-dev
-      - name: Build
-        run: cargo build -p wordcraft
-      - name: Package
-        run: |
-          mkdir -p dist
-          cp target/debug/wordcraft dist/
-          cp README.md TERMUX.md dist/
-          tar -czf wordcraft-debug-linux-x86_64.tar.gz -C dist .
+          set -euo pipefail
+          mkdir -p out
+          chmod 777 out
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/out:/out" \
+            -e CARGO_BUILD_JOBS=4 \
+            -e CARGO_PROFILE_DEV_DEBUG=0 \
+            termux/termux-docker:aarch64 \
+            bash -lc '
+              set -eu
+              cp -a /src "$HOME/wordcraft"
+              cd "$HOME/wordcraft"
+              export DEBIAN_FRONTEND=noninteractive
+              pkg update -y
+              pkg install -y rust git
+              bash build-termux.sh
+              bash package-termux.sh
+              cp dist/*.deb /out/
+            '
       - uses: actions/upload-artifact@v5
         with:
-          name: wordcraft-debug-linux-x86_64
-          path: wordcraft-debug-linux-x86_64.tar.gz
+          name: wordcraft-deb-debug
+          path: out/*.deb
+          if-no-files-found: error
           retention-days: 14

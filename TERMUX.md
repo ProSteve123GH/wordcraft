@@ -156,20 +156,21 @@ default. On devices where VirGL works, install `virglrenderer-android`, start
 
 ## Builds and releases
 
-`.github/workflows/build.yml` builds the debug app on Linux x86-64 for every push and pull request
-and attaches it to the run (Artifacts). `.github/workflows/release.yml` builds the release app and
-publishes a GitHub release:
+Both workflows produce the Termux package, the same way the tablet does: the source is compiled
+inside the `termux/termux-docker:aarch64` container on GitHub's free `ubuntu-24.04-arm` runner, with
+Termux's own bionic toolchain, and `package-termux.sh` turns it into an installable `.deb`. The
+runner has to be arm64 because that container is arm64; an x86-64 runner would have to emulate it.
 
-- push a tag: `git tag v0.0.1 && git push origin v0.0.1`, or
-- run the workflow by hand (Actions › Release › Run workflow): it bumps the workspace version from
-  the latest tag — patch by default, starting at 0.0.1 — commits the bump, builds and releases. You
-  can pick minor or major, or type an exact version.
+- `.github/workflows/build.yml` — debug `.deb` for every push to `main`, every pull request and
+  manual runs; attached to the run (Artifacts).
+- `.github/workflows/release.yml` — release `.deb`, published as a GitHub release:
+  - push a tag: `git tag v0.0.1 && git push origin v0.0.1`, or
+  - run the workflow by hand (Actions › Release › Run workflow): it bumps the workspace version from
+    the latest tag — patch by default, starting at 0.0.1 — commits the bump, builds and releases.
+    You can pick minor or major, or type an exact version.
 
-Neither workflow produces the Termux binary: that needs Termux's own `$PREFIX` libraries, which the
-x86-64 runner does not have, so the release asset is the desktop (Linux x86-64) build. The tablet
-build stays `build-termux.sh` on-device, or `.github/workflows/termux.yml` (manual): it builds the
-aarch64 `.deb` inside the `termux/termux-docker:aarch64` container on GitHub's free arm64 runner and
-can attach it to a release by tag.
+Download `wordcraft_<version>_aarch64.deb` from the release and install it as above. Nothing in CI
+needs secrets beyond the workflow's own `GITHUB_TOKEN`.
 
 ## Known limits
 
