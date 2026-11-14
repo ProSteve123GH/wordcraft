@@ -48,38 +48,55 @@ jobs:
           INPUT_BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
+          # Cargo.toml is the version of record, never the newest tag: a fork keeps the tags from
+          # upstream history (v0.18.x here), and releasing from them would skip this port's 0.0.1.
+          current="$(sed -n 's/^version = "\([0-9][^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$current" ]; then
+            echo "Cargo.toml has no workspace version" >&2
+            exit 1
+          fi
           if [ "$GITHUB_EVENT_NAME" = "push" ]; then
             VERSION="${GITHUB_REF_NAME#v}"
             TAG="$GITHUB_REF_NAME"
+            if [ "$VERSION" != "$current" ]; then
+              echo "Tag $TAG does not match Cargo.toml version $current." >&2
+              echo "Bump [workspace.package] version on main, then tag that commit." >&2
+              exit 1
+            fi
           else
             VERSION="${INPUT_VERSION#v}"
             if [ -z "$VERSION" ]; then
-              last="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
-              last="${last#v}"
-              last="${last:-0.0.0}"
-              IFS=. read -r major minor patch <<< "$last"
-              case "$INPUT_BUMP" in
-                major) major=$((major + 1)); minor=0; patch=0 ;;
-                minor) minor=$((minor + 1)); patch=0 ;;
-                *)     patch=$((patch + 1)) ;;
-              esac
-              VERSION="$major.$minor.$patch"
+              if git rev-parse -q --verify "refs/tags/v$current" >/dev/null; then
+                # Released already: move on from that version.
+                IFS=. read -r major minor patch <<< "$current"
+                case "${INPUT_BUMP:-patch}" in
+                  major) major=$((major + 1)); minor=0; patch=0 ;;
+                  minor) minor=$((minor + 1)); patch=0 ;;
+                  *)     patch=$((patch + 1)) ;;
+                esac
+                VERSION="$major.$minor.$patch"
+              else
+                # Not released yet: release the version in Cargo.toml as it is.
+                VERSION="$current"
+              fi
             fi
             TAG="v$VERSION"
-            # The released package should report the released version.
-            sed -i -E '0,/^version = "[0-9]+\.[0-9]+\.[0-9]+"$/s//version = "'"$VERSION"'"/' Cargo.toml
-            cargo update --workspace
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add -A
-            if git diff --cached --quiet; then
-              echo "Cargo.toml already at $VERSION; nothing to commit."
-            else
-              git commit -m "Release v$VERSION"
-              if [ "$GITHUB_REF_TYPE" = "branch" ]; then
-                git push origin "HEAD:$GITHUB_REF_NAME"
+            if [ "$VERSION" != "$current" ]; then
+              # The released package should report the released version.
+              sed -i -E '0,/^version = "[0-9]+\.[0-9]+\.[0-9]+"$/s//version = "'"$VERSION"'"/' Cargo.toml
+              cargo update --workspace
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add -A
+              if git diff --cached --quiet; then
+                echo "Cargo.toml already at $VERSION; nothing to commit."
               else
-                echo "Not on a branch; leaving the bump commit local." >&2
+                git commit -m "Release v$VERSION"
+                if [ "$GITHUB_REF_TYPE" = "branch" ]; then
+                  git push origin "HEAD:$GITHUB_REF_NAME"
+                else
+                  echo "Not on a branch; leaving the bump commit local." >&2
+                fi
               fi
             fi
           fi

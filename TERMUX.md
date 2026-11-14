@@ -163,11 +163,12 @@ runner has to be arm64 because that container is arm64; an x86-64 runner would h
 
 - `.github/workflows/build.yml` — debug `.deb` for every push to `main`, every pull request and
   manual runs; attached to the run (Artifacts).
-- `.github/workflows/release.yml` — release `.deb`, published as a GitHub release:
-  - push a tag: `git tag v0.0.1 && git push origin v0.0.1`, or
-  - run the workflow by hand (Actions › Release › Run workflow): it bumps the workspace version from
-    the latest tag — patch by default, starting at 0.0.1 — commits the bump, builds and releases.
-    You can pick minor or major, or type an exact version.
+- `.github/workflows/publish.yml` — release `.deb`, published as a GitHub release:
+  - push a tag for the version already in `Cargo.toml`: `git tag v0.0.1 && git push origin v0.0.1`, or
+  - run the workflow by hand (Actions › Release › Run workflow): it releases the
+    `[workspace.package] version` from `Cargo.toml` (0.0.1 to start); if that version already has a
+    tag, it bumps it — patch unless you pick minor or major — commits the bump and releases. You can
+    also type an exact version. Tags inherited from upstream (`v0.18.x` here) are ignored.
 
 Download `wordcraft_<version>_aarch64.deb` from the release and install it as above. Nothing in CI
 needs secrets beyond the workflow's own `GITHUB_TOKEN`.
