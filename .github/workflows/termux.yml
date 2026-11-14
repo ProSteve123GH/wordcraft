@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           # The .deb can finish before the release workflow has published the release.
-          for _ in $(seq 1 60); do
+          for _ in $(seq 1 120); do
             gh release view "$TAG" >/dev/null 2>&1 && break
             sleep 30
           done
